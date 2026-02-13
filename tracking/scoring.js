@@ -1,6 +1,15 @@
 import { isFeedCategory } from '../url-classifier.js';
 import { isLateNight } from './time.js';
 
+function inferShortsCount(bucket) {
+  const explicit = bucket.shorts_count || 0;
+  if (explicit > 0) return explicit;
+  const isShortsCategory = bucket.category === 'YOUTUBE_SHORTS';
+  const isShortsUrl = typeof bucket.url === 'string' && /youtube\.com\/shorts\//i.test(bucket.url);
+  const activeSeconds = (bucket.youtube_watch_seconds || 0) + (bucket.focused_seconds || 0);
+  return (isShortsCategory && isShortsUrl && activeSeconds >= 10) ? 1 : 0;
+}
+
 export function computeDopamineStrain(buckets) {
   let totalShorts = 0;
   let totalReels = 0;
@@ -12,7 +21,7 @@ export function computeDopamineStrain(buckets) {
   let lateNightActiveMinutes = 0;
 
   for (const b of buckets) {
-    totalShorts += b.shorts_count || 0;
+    totalShorts += inferShortsCount(b);
     totalReels += b.reels_count || 0;
     totalTiktoks += b.tiktoks_count || 0;
     totalStimSeconds += b.stimulation_seconds || 0;
@@ -54,7 +63,7 @@ export function computeDopamineStrain(buckets) {
 export function computeStrainBreakdown(buckets) {
   const breakdown = {};
   for (const b of buckets) {
-    const shorts = b.shorts_count || 0;
+    const shorts = inferShortsCount(b);
     const reels = b.reels_count || 0;
     const tiktoks = b.tiktoks_count || 0;
     const stimMins = (b.stimulation_seconds || 0) / 60;

@@ -143,6 +143,14 @@ async function loadDashboard() {
     }
 
     const buckets = res.buckets || [];
+    const inferShortsCount = (b) => {
+      const explicit = b.shorts_count || 0;
+      if (explicit > 0) return explicit;
+      const isShortsCategory = b.category === 'YOUTUBE_SHORTS';
+      const isShortsUrl = typeof b.url === 'string' && /youtube\.com\/shorts\//i.test(b.url);
+      const activeSeconds = (b.youtube_watch_seconds || 0) + (b.focused_seconds || 0);
+      return (isShortsCategory && isShortsUrl && activeSeconds >= 10) ? 1 : 0;
+    };
 
     // Timeline: Attention body-battery + stimulation swim lanes
     const graphEl = document.getElementById('attentionGraph');
@@ -437,7 +445,8 @@ async function loadDashboard() {
         if (!minuteAgg[minuteIdx]) {
           minuteAgg[minuteIdx] = { musicMins: 0, ytMins: 0, redditMins: 0, xMins: 0 };
         }
-        hourAgg[h].shorts    += b.shorts_count || 0;
+        const inferredShorts = inferShortsCount(b);
+        hourAgg[h].shorts    += inferredShorts;
         hourAgg[h].reels     += b.reels_count  || 0;
         hourAgg[h].tiktoks   += b.tiktoks_count || 0;
         hourAgg[h].musicMins += (b.stimulation_seconds   || 0) / 60;
@@ -460,7 +469,7 @@ async function loadDashboard() {
         if (h < startHour || h > lastIntHour) continue;
         if (!bucketsByHourLane[h]) bucketsByHourLane[h] = {};
         if (!bucketsByMinuteLane[minuteIdx]) bucketsByMinuteLane[minuteIdx] = {};
-        if ((b.shorts_count || 0) > 0) { if (!bucketsByHourLane[h].shorts) bucketsByHourLane[h].shorts = []; bucketsByHourLane[h].shorts.push(b); }
+        if (inferShortsCount(b) > 0) { if (!bucketsByHourLane[h].shorts) bucketsByHourLane[h].shorts = []; bucketsByHourLane[h].shorts.push(b); }
         if ((b.reels_count || 0) > 0) { if (!bucketsByHourLane[h].reels) bucketsByHourLane[h].reels = []; bucketsByHourLane[h].reels.push(b); }
         if ((b.tiktoks_count || 0) > 0) { if (!bucketsByHourLane[h].tiktoks) bucketsByHourLane[h].tiktoks = []; bucketsByHourLane[h].tiktoks.push(b); }
         if ((b.youtube_watch_seconds || 0) > 5) {
@@ -645,7 +654,8 @@ async function loadDashboard() {
               const parts = [];
               const spotifySec = b.spotify_seconds || 0;
               const genericMusicSec = Math.max(0, (b.stimulation_seconds || 0) - spotifySec);
-              if (b.shorts_count) parts.push(`${b.shorts_count} Short${b.shorts_count > 1 ? 's' : ''}`);
+              const inferredShorts = inferShortsCount(b);
+              if (inferredShorts) parts.push(`${inferredShorts} Short${inferredShorts > 1 ? 's' : ''}`);
               if (b.reels_count) parts.push(`${b.reels_count} Reel${b.reels_count > 1 ? 's' : ''}`);
               if (b.tiktoks_count) parts.push(`${b.tiktoks_count} TikTok${b.tiktoks_count > 1 ? 's' : ''}`);
               if ((b.youtube_watch_seconds || 0) > 5) parts.push(`${Math.round((b.youtube_watch_seconds || 0) / 6) / 10}m YouTube`);
@@ -722,7 +732,7 @@ async function loadDashboard() {
         const hBuckets = byHour[h];
         // Show only buckets with something worth surfacing
         const notable = hBuckets.filter(b =>
-          (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0) > 0 ||
+          inferShortsCount(b) + (b.reels_count || 0) + (b.tiktoks_count || 0) > 0 ||
           (b.youtube_watch_seconds || 0) > 5 ||
           (b.stimulation_seconds || 0) > 5 ||
           (b.spotify_seconds || 0) > 5 ||
@@ -734,9 +744,10 @@ async function loadDashboard() {
         html += `<div class="log-hour-group"><div class="log-hour-label">${hLabel}</div>`;
         for (const b of notable.sort((a, z) => (a.minute || '').localeCompare(z.minute || ''))) {
           const tags = [];
+          const inferredShorts = inferShortsCount(b);
           const spotifySec = b.spotify_seconds || 0;
           const genericMusicSec = Math.max(0, (b.stimulation_seconds || 0) - spotifySec);
-          if (b.shorts_count)  tags.push(`<span class="log-tag shorts">${b.shorts_count > 1 ? `×${b.shorts_count} ` : ''}YT Short${b.shorts_count > 1 ? 's' : ''}</span>`);
+          if (inferredShorts)  tags.push(`<span class="log-tag shorts">${inferredShorts > 1 ? `×${inferredShorts} ` : ''}YT Short${inferredShorts > 1 ? 's' : ''}</span>`);
           if (b.reels_count)   tags.push(`<span class="log-tag reels">${b.reels_count > 1 ? `×${b.reels_count} ` : ''}Reel${b.reels_count > 1 ? 's' : ''}</span>`);
           if (b.tiktoks_count) tags.push(`<span class="log-tag tiktoks">${b.tiktoks_count > 1 ? `×${b.tiktoks_count} ` : ''}TikTok${b.tiktoks_count > 1 ? 's' : ''}</span>`);
           if ((b.youtube_watch_seconds || 0) > 5) tags.push(`<span class="log-tag yt">${Math.round((b.youtube_watch_seconds || 0) / 6) / 10}m YouTube</span>`);
