@@ -1,5 +1,7 @@
 # Whoop for Dopamine
 
+![Whoopamine Screenshot](WhoopamineScreenshot.png)
+
 ## Installation
 
 1. Open `chrome://extensions`
