@@ -1,4 +1,4 @@
-# Whoop for Dopamine
+# Whoop for tracking Attention Span
 
 ![Whoopamine Screenshot](WhoopamineScreenshot.png)
 
