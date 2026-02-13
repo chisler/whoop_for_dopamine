@@ -3,6 +3,8 @@
  */
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 44;
+const DASHBOARD_REFRESH_MS = 5000;
+let dashboardLoadInFlight = false;
 
 const ICONS = {
   // Brand icons with proper colors — used in swim lanes and culprit list
@@ -47,6 +49,13 @@ const CULPRIT_ICONS = {
   lateNightMinutes: 'late'
 };
 
+function getLocalDateStr(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function setRingProgress(el, value, max) {
   if (!el || typeof value !== 'number' || isNaN(value)) return;
   const pct = Math.min(1, Math.max(0, value / max));
@@ -61,6 +70,8 @@ function getAttentionColor(pct) {
 }
 
 async function loadDashboard() {
+  if (dashboardLoadInFlight) return;
+  dashboardLoadInFlight = true;
   try {
     const res = await chrome.runtime.sendMessage({ type: 'GET_DASHBOARD' });
     if (!res) return;
@@ -228,7 +239,15 @@ async function loadDashboard() {
       }
 
       const totalRawStrain = Object.values(rawStrainByMinute).reduce((s, v) => s + v, 0);
-      const RECOVERY_PER_IDLE_MINUTE = 0.2;  // ~0.2% per idle minute
+      // Weight by sqrt to dampen single-minute spikes from bursty event logging.
+      const weightedStrainByMinute = {};
+      for (const [minuteIdx, raw] of Object.entries(rawStrainByMinute)) {
+        weightedStrainByMinute[minuteIdx] = Math.sqrt(Math.max(0, raw));
+      }
+      const totalWeightedStrain = Object.values(weightedStrainByMinute).reduce((s, v) => s + v, 0);
+      const RECOVERY_PER_IDLE_MINUTE = 0.05;
+      const MAX_DROP_PER_MINUTE = 3.0;
+      const MAX_RISE_PER_MINUTE = 0.2;
 
       // Walk minute-by-minute from session start to now for granular curve
       const attPoints = [];
@@ -247,26 +266,33 @@ async function loadDashboard() {
         if (m > startMinuteIdx) {
           const prevM = m - step;
           let stepRawStrain = 0;
+          let stepWeightedStrain = 0;
           const minuteBreakdown = [];
           for (let i = prevM; i < m; i++) {
             const r = rawStrainByMinute[i] || 0;
+            const w = weightedStrainByMinute[i] || 0;
             stepRawStrain += r;
-            minuteBreakdown.push({ minuteIdx: i, hour: (i / 60).toFixed(2), rawStrain: r });
+            stepWeightedStrain += w;
+            minuteBreakdown.push({ minuteIdx: i, hour: (i / 60).toFixed(2), rawStrain: r, weightedStrain: w });
           }
-          if (stepRawStrain > 0 && totalRawStrain > 0) {
-            const depletion = (stepRawStrain / totalRawStrain) * dailyStrain;
-            att = Math.max(0, att - depletion);
+          if (stepWeightedStrain > 0 && totalWeightedStrain > 0) {
+            const depletion = (stepWeightedStrain / totalWeightedStrain) * dailyStrain;
+            const maxDrop = MAX_DROP_PER_MINUTE * (m - prevM);
+            const boundedDepletion = Math.min(depletion, maxDrop);
+            att = Math.max(0, att - boundedDepletion);
             calc = {
-              formula: `depletion = (${stepRawStrain.toFixed(2)} / ${totalRawStrain.toFixed(2)}) * ${dailyStrain} = ${depletion.toFixed(4)}`,
-              prevM, m, stepRawStrain, totalRawStrain, dailyStrain, depletion, prevAtt, att, type: 'deplete',
+              formula: `depletion = (${stepWeightedStrain.toFixed(3)} / ${totalWeightedStrain.toFixed(3)}) * ${dailyStrain} = ${depletion.toFixed(4)}; bounded=${boundedDepletion.toFixed(4)}`,
+              prevM, m, stepRawStrain, stepWeightedStrain, totalRawStrain, totalWeightedStrain, dailyStrain, depletion, boundedDepletion, prevAtt, att, type: 'deplete',
               minuteBreakdown
             };
           } else {
             const recovery = RECOVERY_PER_IDLE_MINUTE * (m - prevM);
-            att = Math.min(100, att + recovery);
+            const maxRise = MAX_RISE_PER_MINUTE * (m - prevM);
+            const boundedRecovery = Math.min(recovery, maxRise);
+            att = Math.min(100, att + boundedRecovery);
             calc = {
-              formula: `recovery = ${RECOVERY_PER_IDLE_MINUTE} * ${m - prevM} = ${recovery.toFixed(4)}`,
-              prevM, m, prevAtt, recovery, att, type: 'recover',
+              formula: `recovery = ${RECOVERY_PER_IDLE_MINUTE} * ${m - prevM} = ${recovery.toFixed(4)}; bounded=${boundedRecovery.toFixed(4)}`,
+              prevM, m, prevAtt, recovery, boundedRecovery, att, type: 'recover',
               minuteBreakdown
             };
           }
@@ -278,29 +304,22 @@ async function loadDashboard() {
         attPoints.push({ x: hourFrac, y: att, stepIndex: stepDetails.length - 1 });
       }
       const lastComputedAtt = attPoints.length > 0 ? attPoints[attPoints.length - 1].y : 100;
-      const jump = Math.abs(lastComputedAtt - attentionNow);
-      // Only force endpoint to match ring when close — avoids fake spike when recovery
-      // pushes curve above ring (different strain formulas can diverge)
-      if (jump <= 5) {
-        attPoints.push({ x: nowHourFrac, y: attentionNow });
-      } else {
-        attPoints.push({ x: nowHourFrac, y: lastComputedAtt });
+      attPoints.push({ x: nowHourFrac, y: lastComputedAtt });
+      // Smoothly align final point to the ring value so we avoid a terminal spike.
+      const endpointDelta = attentionNow - lastComputedAtt;
+      if (attPoints.length > 1 && Math.abs(endpointDelta) > 0.05) {
+        const denom = attPoints.length - 1;
+        for (let i = 1; i < attPoints.length; i++) {
+          const t = i / denom;
+          attPoints[i].y = Math.max(0, Math.min(100, attPoints[i].y + endpointDelta * t));
+        }
       }
-
-      // Debug: log spike if last computed != ring value
-      if (jump > 5) {
-        console.warn('[Attention] Spike detected:', {
-          lastComputedAtt,
-          attentionNow,
-          jump,
-          lastPoint: attPoints[attPoints.length - 2],
-          finalPoint: attPoints[attPoints.length - 1]
-        });
-      }
+      const jump = Math.abs(endpointDelta);
       console.log('[Attention] Debug:', {
         dailyStrain,
         attentionNow,
         totalRawStrain,
+        totalWeightedStrain,
         step,
         startMinuteIdx,
         endMinuteIdx,
@@ -318,6 +337,7 @@ async function loadDashboard() {
           dailyStrain,
           attentionNow,
           totalRawStrain,
+          totalWeightedStrain,
           startHour,
           endHour,
           nowHourFrac,
@@ -326,6 +346,8 @@ async function loadDashboard() {
           step,
           totalMinutes,
           RECOVERY_PER_IDLE_MINUTE,
+          MAX_DROP_PER_MINUTE,
+          MAX_RISE_PER_MINUTE,
           sessionHour: res.sessionStart ? new Date(res.sessionStart).getHours() + new Date(res.sessionStart).getMinutes() / 60 : null,
           firstBucketHour: (() => {
             const b = buckets.filter(b2 => (b2.focused_seconds || 0) > 10 || (b2.switches || 0) > 0 || (b2.shorts_count || 0) > 0).sort((a, z) => (a.hour ?? 0) - (z.hour ?? 0))[0];
@@ -334,6 +356,9 @@ async function loadDashboard() {
         },
         rawStrainByMinute: Object.fromEntries(
           Object.entries(rawStrainByMinute).sort((a, b) => Number(a[0]) - Number(b[0]))
+        ),
+        weightedStrainByMinute: Object.fromEntries(
+          Object.entries(weightedStrainByMinute).sort((a, b) => Number(a[0]) - Number(b[0]))
         ),
         attPoints,
         stepDetails,
@@ -363,6 +388,8 @@ async function loadDashboard() {
           reels_count: b.reels_count,
           tiktoks_count: b.tiktoks_count,
           stimulation_seconds: b.stimulation_seconds,
+          spotify_seconds: b.spotify_seconds || 0,
+          audio_playing_seconds: b.audio_playing_seconds || 0,
           youtube_watch_seconds: b.youtube_watch_seconds,
           focused_seconds: b.focused_seconds,
           switches: b.switches
@@ -422,8 +449,8 @@ async function loadDashboard() {
         if ((b.shorts_count || 0) > 0) { if (!bucketsByHourLane[h].shorts) bucketsByHourLane[h].shorts = []; bucketsByHourLane[h].shorts.push(b); }
         if ((b.reels_count || 0) > 0) { if (!bucketsByHourLane[h].reels) bucketsByHourLane[h].reels = []; bucketsByHourLane[h].reels.push(b); }
         if ((b.tiktoks_count || 0) > 0) { if (!bucketsByHourLane[h].tiktoks) bucketsByHourLane[h].tiktoks = []; bucketsByHourLane[h].tiktoks.push(b); }
-        if ((b.youtube_watch_seconds || 0) > 30) { if (!bucketsByHourLane[h].ytMins) bucketsByHourLane[h].ytMins = []; bucketsByHourLane[h].ytMins.push(b); }
-        if ((b.stimulation_seconds || 0) > 30) { if (!bucketsByHourLane[h].musicMins) bucketsByHourLane[h].musicMins = []; bucketsByHourLane[h].musicMins.push(b); }
+        if ((b.youtube_watch_seconds || 0) > 5) { if (!bucketsByHourLane[h].ytMins) bucketsByHourLane[h].ytMins = []; bucketsByHourLane[h].ytMins.push(b); }
+        if ((b.stimulation_seconds || 0) > 5) { if (!bucketsByHourLane[h].musicMins) bucketsByHourLane[h].musicMins = []; bucketsByHourLane[h].musicMins.push(b); }
         if (REDDIT_SET.has(b.category || '')) { if (!bucketsByHourLane[h].redditMins) bucketsByHourLane[h].redditMins = []; bucketsByHourLane[h].redditMins.push(b); }
         if (X_SET.has(b.category || '')) { if (!bucketsByHourLane[h].xMins) bucketsByHourLane[h].xMins = []; bucketsByHourLane[h].xMins.push(b); }
       }
@@ -461,7 +488,7 @@ async function loadDashboard() {
         } else {
           for (let h = startHour; h <= lastIntHour; h++) {
             const mins = hourAgg[h][lane.key] || 0;
-            if (mins < 0.3) continue;
+            if (mins < 0.05) continue;
             const fraction = Math.min(1, mins / 60);
             const bx = xHour(h) + 1;
             const bw = barColW - 2;
@@ -537,7 +564,7 @@ async function loadDashboard() {
         })();
 
       // Clickable lane dots/bars — show activity detail modal
-      graphEl.addEventListener('click', (e) => {
+      graphEl.onclick = (e) => {
         const g = e.target.closest('.lane-dot-hit, .lane-bar-hit');
         if (!g) return;
         const lane = g.dataset.lane;
@@ -564,11 +591,14 @@ async function loadDashboard() {
             .map(b => {
               const cat = (b.category || 'Unknown').replace(/_/g, ' ');
               const parts = [];
+              const spotifySec = b.spotify_seconds || 0;
+              const genericMusicSec = Math.max(0, (b.stimulation_seconds || 0) - spotifySec);
               if (b.shorts_count) parts.push(`${b.shorts_count} Short${b.shorts_count > 1 ? 's' : ''}`);
               if (b.reels_count) parts.push(`${b.reels_count} Reel${b.reels_count > 1 ? 's' : ''}`);
               if (b.tiktoks_count) parts.push(`${b.tiktoks_count} TikTok${b.tiktoks_count > 1 ? 's' : ''}`);
-              if ((b.youtube_watch_seconds || 0) > 30) parts.push(`${Math.round(b.youtube_watch_seconds / 60)}m YT`);
-              if ((b.stimulation_seconds || 0) > 30) parts.push(`${Math.round(b.stimulation_seconds / 60)}m Music`);
+              if ((b.youtube_watch_seconds || 0) > 5) parts.push(`${Math.round((b.youtube_watch_seconds || 0) / 6) / 10}m YouTube`);
+              if (spotifySec > 5) parts.push(`${Math.round(spotifySec / 6) / 10}m Spotify`);
+              if (genericMusicSec > 5) parts.push(`${Math.round(genericMusicSec / 6) / 10}m Music`);
               if ((b.focused_seconds || 0) > 20 && !parts.length) parts.push(`${Math.round(b.focused_seconds / 60)}m`);
               const displayUrl = b.url ? b.url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').replace(/</g, '&lt;').replace(/"/g, '&quot;') : '';
               const url = b.url ? `<a href="${b.url.replace(/"/g, '&quot;')}" target="_blank" rel="noopener" class="activity-detail-url" title="${b.url.replace(/"/g, '&quot;')}">${displayUrl}</a>` : '';
@@ -577,7 +607,7 @@ async function loadDashboard() {
             .join('');
         }
         modal.style.display = 'flex';
-      });
+      };
 
       // Update legend
       const legendEl = document.querySelector('.graph-legend');
@@ -641,8 +671,9 @@ async function loadDashboard() {
         // Show only buckets with something worth surfacing
         const notable = hBuckets.filter(b =>
           (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0) > 0 ||
-          (b.youtube_watch_seconds || 0) > 30 ||
-          (b.stimulation_seconds || 0) > 30 ||
+          (b.youtube_watch_seconds || 0) > 5 ||
+          (b.stimulation_seconds || 0) > 5 ||
+          (b.spotify_seconds || 0) > 5 ||
           (b.focused_seconds || 0) > 20
         );
         if (!notable.length) continue;
@@ -651,11 +682,14 @@ async function loadDashboard() {
         html += `<div class="log-hour-group"><div class="log-hour-label">${hLabel}</div>`;
         for (const b of notable.sort((a, z) => (a.minute || '').localeCompare(z.minute || ''))) {
           const tags = [];
+          const spotifySec = b.spotify_seconds || 0;
+          const genericMusicSec = Math.max(0, (b.stimulation_seconds || 0) - spotifySec);
           if (b.shorts_count)  tags.push(`<span class="log-tag shorts">${b.shorts_count > 1 ? `×${b.shorts_count} ` : ''}YT Short${b.shorts_count > 1 ? 's' : ''}</span>`);
           if (b.reels_count)   tags.push(`<span class="log-tag reels">${b.reels_count > 1 ? `×${b.reels_count} ` : ''}Reel${b.reels_count > 1 ? 's' : ''}</span>`);
           if (b.tiktoks_count) tags.push(`<span class="log-tag tiktoks">${b.tiktoks_count > 1 ? `×${b.tiktoks_count} ` : ''}TikTok${b.tiktoks_count > 1 ? 's' : ''}</span>`);
-          if ((b.youtube_watch_seconds || 0) > 30) tags.push(`<span class="log-tag yt">${Math.round(b.youtube_watch_seconds / 60)}m YT</span>`);
-          if ((b.stimulation_seconds || 0) > 30)   tags.push(`<span class="log-tag music">${Math.round(b.stimulation_seconds / 60)}m Music</span>`);
+          if ((b.youtube_watch_seconds || 0) > 5) tags.push(`<span class="log-tag yt">${Math.round((b.youtube_watch_seconds || 0) / 6) / 10}m YouTube</span>`);
+          if (spotifySec > 5) tags.push(`<span class="log-tag music">${Math.round(spotifySec / 6) / 10}m Spotify</span>`);
+          if (genericMusicSec > 5) tags.push(`<span class="log-tag music">${Math.round(genericMusicSec / 6) / 10}m Music</span>`);
           if ((b.focused_seconds || 0) > 20 && !tags.length) tags.push(`<span class="log-tag focus">${Math.round(b.focused_seconds / 60)}m focus</span>`);
 
           const cat = (b.category || 'UNKNOWN').replace(/_/g, ' ');
@@ -673,15 +707,17 @@ async function loadDashboard() {
 
       content.innerHTML = html || '<p style="color:var(--text-dim);font-size:12px;padding:8px 4px">No activity recorded yet.</p>';
 
-      toggle.addEventListener('click', () => {
+      toggle.onclick = () => {
         const open = toggle.getAttribute('aria-expanded') === 'true';
         toggle.setAttribute('aria-expanded', String(!open));
         body.style.display = open ? 'none' : 'block';
-      });
+      };
     })();
 
     // Filter toggles: Attention vs Strain
     document.querySelectorAll('.filter-btn').forEach(btn => {
+      if (btn.dataset.bound === '1') return;
+      btn.dataset.bound = '1';
       btn.addEventListener('click', () => {
         document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
@@ -703,10 +739,19 @@ async function loadDashboard() {
 
   } catch (e) {
     console.error('Dashboard load failed:', e);
+  } finally {
+    dashboardLoadInFlight = false;
   }
 }
 
 loadDashboard();
+window.addEventListener('focus', () => loadDashboard());
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) loadDashboard();
+});
+setInterval(() => {
+  if (!document.hidden) loadDashboard();
+}, DASHBOARD_REFRESH_MS);
 
 // Debug export — always attached so it works even if graph block fails
 document.getElementById('debugExportBtn')?.addEventListener('click', () => {
@@ -717,7 +762,7 @@ document.getElementById('debugExportBtn')?.addEventListener('click', () => {
   }
   try {
     const json = JSON.stringify(data, null, 2);
-    const filename = `attention-debug-${new Date().toISOString().slice(0, 10)}.json`;
+    const filename = `attention-debug-${getLocalDateStr()}.json`;
     const a = document.createElement('a');
     a.download = filename;
     a.style.display = 'none';

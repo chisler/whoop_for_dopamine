@@ -81,15 +81,36 @@ function isMusicSite() {
   return /spotify\.com|music\.apple\.com|soundcloud\.com/i.test(window.location.href);
 }
 
-// Music: fire a heartbeat every 10s only when audio is actually playing
+function isAnyMediaPlaying() {
+  const mediaEls = document.querySelectorAll('audio,video');
+  for (const el of mediaEls) {
+    if (!el.paused && !el.ended && el.readyState >= 2) return true;
+  }
+  try {
+    if (navigator.mediaSession?.playbackState === 'playing') return true;
+  } catch {}
+  return false;
+}
+
+// Music: heartbeat every few seconds while playback is active.
 function setupMusicTracking() {
-  mediaTrackingIntervals.push(setInterval(() => {
-    const video = document.querySelector('video');
-    const audio = document.querySelector('audio');
-    const playing = (video && !video.paused && !video.ended) ||
-                    (audio && !audio.paused && !audio.ended);
-    if (playing) sendEvent('music_playing', { seconds: 10 });
-  }, 10000));
+  const HEARTBEAT_SECONDS = 3;
+  const reportPlayback = () => {
+    if (isAnyMediaPlaying()) sendEvent('music_playing', { seconds: HEARTBEAT_SECONDS });
+  };
+
+  mediaTrackingIntervals.push(setInterval(reportPlayback, HEARTBEAT_SECONDS * 1000));
+
+  const onPlay = (e) => {
+    const tag = e?.target?.tagName;
+    if (tag === 'AUDIO' || tag === 'VIDEO' || isAnyMediaPlaying()) {
+      sendEvent('music_playing', { seconds: 2 });
+    }
+  };
+  document.addEventListener('play', onPlay, { capture: true, signal: mediaAbortController.signal });
+  document.addEventListener('playing', onPlay, { capture: true, signal: mediaAbortController.signal });
+
+  reportPlayback();
 }
 
 // Count short-form videos watched (video ended or swipe to next)
@@ -123,7 +144,6 @@ function setupShortFormTracking() {
     }
   }
 
-  mediaAbortController = new AbortController();
   const video = document.querySelector('video');
   if (video) {
     lastVideoSrc = video.src || video.currentSrc || '';
@@ -165,6 +185,7 @@ function clearMediaTracking() {
 function initMediaTracking() {
   if (mediaTrackingInit) return;
   clearMediaTracking();
+  mediaAbortController = new AbortController();
   if (isYouTubeShorts() || isInstagramReels() || isTikTok()) {
     mediaTrackingInit = true;
     setupShortFormTracking();

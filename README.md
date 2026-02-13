@@ -44,10 +44,15 @@ MVP Chrome extension: track dopamine strain and focus — local-only productivit
 ```
 whoop_for_dopamine/
 ├── manifest.json
-├── background.js      # Service worker: events, bucketing, scoring
+├── background.js      # Service worker orchestration
 ├── content.js         # Scroll + click tracking
 ├── url-classifier.js  # Intent vs feed labels
 ├── storage.js         # IndexedDB wrapper
+├── tracking/
+│   ├── runtime.js     # State, bucket lifecycle, accrual, content events
+│   ├── time.js        # Local date/time helpers
+│   ├── scoring.js     # Strain/focus scoring functions
+│   └── enrich.js      # Visit + bucket enrichment and hourly timeline
 ├── dashboard.html
 ├── dashboard.css
 ├── dashboard.js
