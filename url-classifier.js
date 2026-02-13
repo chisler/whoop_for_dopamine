@@ -4,10 +4,12 @@
  */
 
 const PATTERNS = [
-  // YouTube
-  { pattern: /youtube\.com\/shorts\//i, label: 'YOUTUBE_SHORTS' },
+  // YouTube — shorts first (more specific)
+  { pattern: /youtube\.com\/shorts/i, label: 'YOUTUBE_SHORTS' },
+  { pattern: /youtu\.be\/[a-zA-Z0-9_-]+/i, label: 'YOUTUBE_OTHER' },
   { pattern: /youtube\.com\/watch\?v=/i, label: 'YOUTUBE_WATCH' },
-  { pattern: /youtube\.com\/?$/i, label: 'YOUTUBE_HOME' },
+  { pattern: /youtube\.com\/watch/i, label: 'YOUTUBE_WATCH' },
+  { pattern: /youtube\.com\/?(\?|$)/i, label: 'YOUTUBE_HOME' },
   { pattern: /youtube\.com/i, label: 'YOUTUBE_OTHER' },
 
   // X / Twitter

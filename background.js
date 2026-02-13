@@ -2,7 +2,7 @@
  * Service worker: tab/focus/idle events, bucketing, scoring
  */
 
-import { classifyUrl, isFeedCategory } from './url-classifier.js';
+import { classifyUrl, isFeedCategory, isStimulationCategory } from './url-classifier.js';
 import { addEvent, saveBucket, getBucketByKey, getBucketsForDate, getBucketsInRange, getEventsForDate } from './storage.js';
 
 // --- State (persisted to chrome.storage.session for service worker restarts) ---
@@ -74,6 +74,7 @@ async function getOrCreateBucket() {
       stimulation_seconds: 0,
       youtube_watch_seconds: 0,
       category: state.activeTabUrl ? classifyUrl(state.activeTabUrl) : 'UNKNOWN',
+      url: state.activeTabUrl || null,
       hour
     };
   } else if (!state.pendingBucket) {
@@ -91,6 +92,7 @@ async function getOrCreateBucket() {
         shorts_count: 0, reels_count: 0, tiktoks_count: 0,
         stimulation_seconds: 0, youtube_watch_seconds: 0,
         category: state.activeTabUrl ? classifyUrl(state.activeTabUrl) : 'UNKNOWN',
+        url: state.activeTabUrl || null,
         hour
       };
     }
@@ -109,7 +111,16 @@ async function onTabActivated(activeInfo) {
     if (focusSeconds > 0) {
       const bucket = await getOrCreateBucket();
       bucket.focused_seconds += focusSeconds;
-      // stimulation_seconds is tracked via content-script music_playing events only
+      const prevUrl = state.activeTabUrl;
+      const prevCategory = prevUrl ? classifyUrl(prevUrl) : 'UNKNOWN';
+      if (isStimulationCategory(prevCategory)) {
+        bucket.stimulation_seconds = (bucket.stimulation_seconds || 0) + focusSeconds;
+      }
+      if (prevUrl && prevUrl.startsWith('http')) {
+        bucket.url = prevUrl;
+        if (bucket.category === 'UNKNOWN' || bucket.category === 'OTHER') bucket.category = prevCategory;
+        await saveBucket(bucket);
+      }
     }
   }
 
@@ -134,11 +145,12 @@ async function onTabActivated(activeInfo) {
   state.tabActivatedAt = now;
   await saveState();
 
-  // Emit raw event with timestamp
+  // Emit raw event with timestamp (include url for post-processing)
   await addEvent({
     type: 'active_tab_changed',
     domain: state.activeTabDomain,
     category: classifyUrl(state.activeTabUrl),
+    url: state.activeTabUrl || null,
     tabId: activeInfo.tabId,
     ts: now
   });
@@ -152,24 +164,62 @@ async function onTabActivated(activeInfo) {
   }
 }
 
-async function onContentEvent(msg) {
+async function resolveUrl(msg, sender) {
+  if (msg.url && typeof msg.url === 'string' && msg.url.startsWith('http')) return msg.url;
+  if (sender?.tab?.id) {
+    try {
+      const tab = await chrome.tabs.get(sender.tab.id);
+      if (tab?.url && tab.url.startsWith('http')) return tab.url;
+    } catch {}
+  }
+  return state.activeTabUrl && state.activeTabUrl.startsWith('http') ? state.activeTabUrl : null;
+}
+
+async function setBucketUrl(bucket, url) {
+  if (!url || !url.startsWith('http')) return;
+  bucket.url = url;
+  const cat = classifyUrl(url);
+  if (cat !== 'OTHER' || bucket.category === 'UNKNOWN' || bucket.category === 'OTHER') bucket.category = cat;
+  state.activeTabUrl = url; // Keep in sync for SPA nav (no tab switch)
+  await saveBucket(bucket);
+}
+
+async function onContentEvent(msg, sender) {
   if (msg.type !== 'CONTENT_EVENT') return;
 
   const bucket = await getOrCreateBucket();
+  const url = await resolveUrl(msg, sender);
 
   if (msg.event === 'scroll' || msg.event === 'scroll_batch') {
     bucket.scrolls += msg.count || 1;
     bucket.scroll_distance += msg.distance || 0;
+    await setBucketUrl(bucket, url);
   } else if (msg.event === 'click') {
     bucket.clicks += msg.count || 1;
+    await setBucketUrl(bucket, url);
   } else if (msg.event === 'short_watched') {
     if (msg.source === 'youtube_shorts') bucket.shorts_count = (bucket.shorts_count || 0) + 1;
     else if (msg.source === 'instagram_reels') bucket.reels_count = (bucket.reels_count || 0) + 1;
     else if (msg.source === 'tiktok') bucket.tiktoks_count = (bucket.tiktoks_count || 0) + 1;
+    // short_watched sends url from content script — use it first, then resolveUrl, then active tab
+    let shortUrl = msg.url || url;
+    if (!shortUrl && sender?.tab?.id) {
+      try {
+        const tab = await chrome.tabs.get(sender.tab.id);
+        shortUrl = tab?.url;
+      } catch {}
+    }
+    if (!shortUrl) {
+      const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+      shortUrl = active?.url;
+    }
+    if (shortUrl) await setBucketUrl(bucket, shortUrl);
   } else if (msg.event === 'youtube_playing') {
     bucket.youtube_watch_seconds = (bucket.youtube_watch_seconds || 0) + (msg.seconds || 10);
+    await setBucketUrl(bucket, url);
   } else if (msg.event === 'music_playing') {
     bucket.stimulation_seconds = (bucket.stimulation_seconds || 0) + (msg.seconds || 10);
+    await setBucketUrl(bucket, url);
   }
 }
 
@@ -182,6 +232,16 @@ async function onIdleChange(newState) {
     if (focusSeconds > 0) {
       const bucket = await getOrCreateBucket();
       bucket.focused_seconds += focusSeconds;
+      const url = state.activeTabUrl;
+      const cat = url ? classifyUrl(url) : 'UNKNOWN';
+      if (isStimulationCategory(cat)) {
+        bucket.stimulation_seconds = (bucket.stimulation_seconds || 0) + focusSeconds;
+      }
+      if (url && url.startsWith('http')) {
+        bucket.url = url;
+        if (bucket.category === 'UNKNOWN' || bucket.category === 'OTHER') bucket.category = cat;
+        await saveBucket(bucket);
+      }
     }
     state.tabActivatedAt = null;
   } else if (newState === 'active') {
@@ -203,6 +263,16 @@ async function onWindowFocusChanged(windowId) {
     if (focusSeconds > 0) {
       const bucket = await getOrCreateBucket();
       bucket.focused_seconds += focusSeconds;
+      const url = state.activeTabUrl;
+      const cat = url ? classifyUrl(url) : 'UNKNOWN';
+      if (isStimulationCategory(cat)) {
+        bucket.stimulation_seconds = (bucket.stimulation_seconds || 0) + focusSeconds;
+      }
+      if (url && url.startsWith('http')) {
+        bucket.url = url;
+        if (bucket.category === 'UNKNOWN' || bucket.category === 'OTHER') bucket.category = cat;
+        await saveBucket(bucket);
+      }
     }
     state.tabActivatedAt = null;
   } else if (!wasFocused && focused) {
@@ -330,16 +400,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const sessionKey = `sessionStart_${today}`;
       const { [sessionKey]: sessionStart } = await chrome.storage.local.get(sessionKey);
 
-      // Visits = tab changes with timestamps
-      const visits = events
+      // Visits = tab changes with timestamps (include url when available)
+      let visits = events
         .filter(e => e.type === 'active_tab_changed')
-        .map(e => ({ ts: e.ts, domain: e.domain, category: e.category }));
+        .map(e => ({ ts: e.ts, domain: e.domain, category: e.category, url: e.url }))
+        .sort((a, b) => a.ts - b.ts);
 
-      const strain = computeDopamineStrain(buckets);
-      const { totalFocus, longestBlock } = computeFocusMinutes(buckets);
+      // Fallback: if no visits, use state or current tab (exclude dashboard/extension URLs)
+      const isWebUrl = u => u && u.startsWith('http') && !u.startsWith('chrome-extension://');
+      if (visits.length === 0 && isWebUrl(state.activeTabUrl)) {
+        const domain = new URL(state.activeTabUrl).hostname.replace(/^www\./, '');
+        visits = [{ ts: Date.now(), domain, category: classifyUrl(state.activeTabUrl), url: state.activeTabUrl }];
+      }
+      if (visits.length === 0) {
+        try {
+          const tabs = await chrome.tabs.query({});
+          const webTab = tabs.find(t => isWebUrl(t.url));
+          if (webTab) {
+            const domain = new URL(webTab.url).hostname.replace(/^www\./, '');
+            visits = [{ ts: webTab.lastAccessed || Date.now(), domain, category: classifyUrl(webTab.url), url: webTab.url }];
+          }
+        } catch {}
+      }
+
+      // Post-process: infer URL from visits, re-classify from URL, semantic override from counts
+      const enrichedBuckets = buckets.map(b => {
+        const b2 = { ...b };
+        // 1. Infer URL from visits if missing (use visit.url or construct from domain)
+        if (!b2.url && visits.length > 0) {
+          const bucketTs = b2.timestamp || new Date(`${b2.date}T${b2.minute}:00`).getTime();
+          const active = visits.filter(v => v.ts <= bucketTs).pop() || visits[0];
+          b2.url = (active?.url && active.url.startsWith('http')) ? active.url : (active?.domain ? `https://${active.domain}` : null);
+        }
+        // 2. Re-classify from URL when category is wrong (URL is source of truth)
+        if (b2.url && (b2.category === 'UNKNOWN' || b2.category === 'OTHER')) {
+          const fromUrl = classifyUrl(b2.url);
+          if (fromUrl !== 'OTHER') b2.category = fromUrl;
+        }
+        // 3. Semantic override: counts tell us what we were watching
+        if ((b2.category === 'UNKNOWN' || b2.category === 'OTHER') && (b2.shorts_count || 0) > 0) b2.category = 'YOUTUBE_SHORTS';
+        else if ((b2.category === 'UNKNOWN' || b2.category === 'OTHER') && (b2.reels_count || 0) > 0) b2.category = 'INSTAGRAM_REELS';
+        else if ((b2.category === 'UNKNOWN' || b2.category === 'OTHER') && (b2.tiktoks_count || 0) > 0) b2.category = 'TIKTOK';
+        return b2;
+      });
+
+      const strain = computeDopamineStrain(enrichedBuckets);
+      const { totalFocus, longestBlock } = computeFocusMinutes(enrichedBuckets);
 
       // Strain breakdown — only non-zero
-      const rawBreakdown = computeStrainBreakdown(buckets);
+      const rawBreakdown = computeStrainBreakdown(enrichedBuckets);
       const strainBreakdown = Object.entries(rawBreakdown)
         .filter(([, v]) => v > 0)
         .map(([key, value]) => ({ key, value }));
@@ -347,7 +456,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Top triggers + full category breakdown
       const categoryCounts = {};
       let totalSwitches = 0;
-      for (const b of buckets) {
+      for (const b of enrichedBuckets) {
         categoryCounts[b.category] = (categoryCounts[b.category] || 0) + (b.focused_seconds / 60);
         totalSwitches += b.switches || 0;
       }
@@ -372,7 +481,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           feed: false
         };
       }
-      for (const b of buckets) {
+      for (const b of enrichedBuckets) {
         const h = b.hour ?? (parseInt(String(b.minute || '0').split(':')[0], 10) || 0);
         const shorts = (b.shorts_count || 0);
         const reels = (b.reels_count || 0);
@@ -417,7 +526,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         trend,
         sessionStart: sessionStart || null,
         visits,
-        buckets: buckets.map(b => ({
+        buckets: enrichedBuckets.map(b => ({
           ...b,
           hour: b.hour ?? (parseInt(String(b.minute || '0').split(':')[0], 10) || 0)
         })),
@@ -439,7 +548,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const today = new Date().toISOString().slice(0, 10);
       const buckets = await getBucketsForDate(today);
-      sendResponse({ date: today, buckets });
+      const events = await getEventsForDate(today);
+      const visits = events
+        .filter(e => e.type === 'active_tab_changed')
+        .map(e => ({ ts: e.ts, domain: e.domain, category: e.category, url: e.url }))
+        .sort((a, b) => a.ts - b.ts);
+      const enriched = buckets.map(b => {
+        const b2 = { ...b };
+        if (!b2.url && visits.length > 0) {
+          const bucketTs = b2.timestamp || new Date(`${b2.date}T${b2.minute}:00`).getTime();
+          const active = visits.filter(v => v.ts <= bucketTs).pop() || visits[0];
+          b2.url = (active?.url && active.url.startsWith('http')) ? active.url : (active?.domain ? `https://${active.domain}` : null);
+        }
+        return b2;
+      });
+      sendResponse({ date: today, buckets: enriched });
     })();
     return true;
   }
@@ -459,11 +582,32 @@ chrome.action.onClicked.addListener(async () => {
 });
 
 chrome.tabs.onActivated.addListener(onTabActivated);
+
+// When user navigates within same tab (link click, URL bar), update state and record visit
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId !== state.activeTabId) return;
+  const url = changeInfo.url ?? tab?.url;
+  if (url && url.startsWith('http') && url !== state.activeTabUrl) {
+    state.activeTabUrl = url;
+    state.activeTabDomain = new URL(url).hostname.replace(/^www\./, '');
+    saveState();
+    addEvent({
+      type: 'active_tab_changed',
+      domain: state.activeTabDomain,
+      category: classifyUrl(url),
+      url,
+      tabId,
+      ts: Date.now()
+    });
+  }
+});
+
 chrome.idle.onStateChanged.addListener(onIdleChange);
 chrome.windows.onFocusChanged.addListener(onWindowFocusChanged);
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'CONTENT_EVENT') {
-    onContentEvent(msg);
+    onContentEvent(msg, sender).then(() => sendResponse?.()).catch(() => sendResponse?.());
+    return true; // Keep channel open so SW stays alive until save completes
   }
 });
 

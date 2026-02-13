@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dopamine Dashboard — Whoop for Dopamine</title>
+  <title>WHOOPAMINE — Dopamine Dashboard</title>
   <link rel="stylesheet" href="dashboard.css">
 </head>
 <body>
   <div class="dashboard">
     <header>
-      <h1>WHOOP</h1>
-      <p class="subtitle">for STIMULATION</p>
+      <h1>WHOOPAMINE</h1>
+      <p class="subtitle">Whoop for tracking overstimulation</p>
     </header>
 
     <section class="rings">
@@ -60,7 +60,7 @@
         <button class="filter-btn" data-metric="strain">Strain</button>
       </div>
       <div class="graph-container">
-        <svg class="attention-graph" id="attentionGraph" viewBox="0 0 420 220" preserveAspectRatio="xMidYMid meet"></svg>
+        <svg class="attention-graph" id="attentionGraph" viewBox="0 0 640 320" preserveAspectRatio="xMidYMid meet"></svg>
       </div>
       <div class="graph-legend">
         <span class="legend-item"><span class="legend-line attention"></span> Attention</span>
@@ -92,7 +92,17 @@
 
     <footer>
       <p class="privacy">Local-only · Nothing uploaded</p>
+      <button type="button" class="debug-export-btn" id="debugExportBtn">Export debug JSON</button>
     </footer>
+  </div>
+
+  <div class="activity-modal" id="activityModal" role="dialog" aria-modal="true" aria-labelledby="activityModalTitle" style="display:none">
+    <div class="activity-modal-backdrop" id="activityModalBackdrop"></div>
+    <div class="activity-modal-content">
+      <h3 class="activity-modal-title" id="activityModalTitle">Activity detail</h3>
+      <div class="activity-modal-body" id="activityModalBody"></div>
+      <button type="button" class="activity-modal-close" id="activityModalClose">Close</button>
+    </div>
   </div>
   <script src="dashboard.js"></script>
 </body>

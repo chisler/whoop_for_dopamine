@@ -53,6 +53,13 @@ function setRingProgress(el, value, max) {
   el.style.strokeDashoffset = RING_CIRCUMFERENCE * (1 - pct);
 }
 
+// Attention color: green (100) → teal (50) → blue (0) — available attention stays green
+function getAttentionColor(pct) {
+  const t = Math.min(1, Math.max(0, pct / 100));
+  const hue = 120 + (1 - t) * 120;
+  return `hsl(${hue}, 55%, 48%)`;
+}
+
 async function loadDashboard() {
   try {
     const res = await chrome.runtime.sendMessage({ type: 'GET_DASHBOARD' });
@@ -68,7 +75,9 @@ async function loadDashboard() {
     document.getElementById('block').textContent = longestBlock;
 
     setRingProgress(document.getElementById('strain-ring'), strain, 100);
-    setRingProgress(document.getElementById('focus-ring'), attentionSpan, 100);
+    const focusRing = document.getElementById('focus-ring');
+    setRingProgress(focusRing, attentionSpan, 100);
+    focusRing.style.stroke = '#34c759';
     setRingProgress(document.getElementById('block-ring'), longestBlock, 60);
 
     // Context switches
@@ -122,11 +131,12 @@ async function loadDashboard() {
       }
     }
 
+    const buckets = res.buckets || [];
+
     // Timeline: Attention body-battery + stimulation swim lanes
     const graphEl = document.getElementById('attentionGraph');
     if (graphEl) {
       let data = res.hourlyTimeline || [];
-      const buckets = res.buckets || [];
 
       // Fallback: build hourly strain from buckets if timeline is empty
       if (!data.length && buckets.length) {
@@ -145,8 +155,6 @@ async function loadDashboard() {
       // ── Time window: first activity → now ───────────────────────────────
       const nowDate   = new Date();
       const nowHourFrac = nowDate.getHours() + nowDate.getMinutes() / 60;
-      // First activity: prefer sessionStart timestamp.
-      // Fall back to first bucket that has real activity (not an empty midnight bucket).
       const sessionHour = res.sessionStart
         ? new Date(res.sessionStart).getHours() + new Date(res.sessionStart).getMinutes() / 60
         : null;
@@ -154,12 +162,18 @@ async function loadDashboard() {
         .filter(b => (b.focused_seconds || 0) > 10 || (b.switches || 0) > 0 || (b.shorts_count || 0) > 0)
         .sort((a, b2) => (a.hour ?? 0) - (b2.hour ?? 0))[0];
       const firstBucketHour = firstActiveBucket ? (firstActiveBucket.hour ?? null) : null;
-      const startHour = Math.floor(sessionHour ?? firstBucketHour ?? Math.max(0, nowHourFrac - 1));
+      // Use earlier of session or first activity — avoids steep drop when session starts
+      // after morning strain (e.g. Chrome opened 12:28 but user had 11am YT Shorts)
+      const startHour = Math.floor(
+        (sessionHour != null || firstBucketHour != null)
+          ? Math.min(sessionHour ?? 24, firstBucketHour ?? 24)
+          : Math.max(0, nowHourFrac - 1)
+      );
       // End is current fractional hour (never draw the future)
       const endHour = Math.max(startHour + 1, nowHourFrac);
 
       // ── Layout ──────────────────────────────────────────────────────────
-      const w = 420;
+      const w = 640;
       const attnH = 170;                   // attention plot height (taller)
       const pad = { left: 56, right: 16, top: 16 };
       const plotW = w - pad.left - pad.right;
@@ -190,38 +204,181 @@ async function loadDashboard() {
 
       const y = v => pad.top + attnH - (v / 100) * attnH;
 
-      // ── Attention line (anchored to the ring's strain value) ─────────────
-      // The ring already computed the authoritative attention value using proper
-      // sqrt-saturation curves. Use that as the endpoint and distribute the
-      // depletion proportionally over each hour's raw strain weight.
-      // This guarantees graph endpoint == ring value, always.
+      // ── Granular attention curve (per-minute depletion + recovery) ───────
+      // Body-battery style: depletes with stimulation, recovers when idle.
+      // Uses per-minute buckets for smooth up/down transitions.
+      const dailyStrain   = res.today?.strain ?? 0;
+      const attentionNow  = 100 - dailyStrain;
       const lastIntHour   = Math.floor(nowHourFrac);
-      const activeData    = data.filter(x => x.hour >= startHour && x.hour <= lastIntHour);
-      const dailyStrain   = res.today?.strain ?? 0;          // 0-100, from ring
-      const attentionNow  = 100 - dailyStrain;               // matches ring exactly
-      const totalRawStrain = activeData.reduce((s, x) => s + (x.strain || 0), 0);
 
-      // attByHour[h] = attention value AT THE START of hour h (h:00)
-      // Strain of hour h depletes the battery entering hour h+1
-      const attByHour = { [startHour]: 100 };
-      let depletedSoFar = 0;
-      for (let h = startHour; h <= lastIntHour; h++) {
-        const rawS = (data.find(x => x.hour === h) || { strain: 0 }).strain || 0;
-        const frac = totalRawStrain > 0 ? rawS / totalRawStrain : 0;
-        depletedSoFar += frac * dailyStrain;
-        attByHour[h + 1] = Math.max(0, 100 - depletedSoFar);
+      // Build per-minute raw strain from buckets (keyed by minute index for easy lookup)
+      const FEED_SET = new Set(['X_HOME', 'X_SEARCH', 'X_OTHER', 'X_THREAD', 'REDDIT_FEED', 'YOUTUBE_HOME']);
+      const rawStrainByMinute = {};
+      for (const b of buckets) {
+        const minuteKey = b.minute || '00:00';
+        const [hh, mm] = minuteKey.split(':').map(Number);
+        const minuteIdx = hh * 60 + mm;  // e.g. 9:30 -> 570
+        const hourFrac = hh + mm / 60;
+        if (hourFrac < startHour || hourFrac > endHour) continue;
+        const shortForm = (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0);
+        const stimMins = ((b.stimulation_seconds || 0) + (b.youtube_watch_seconds || 0)) / 60;
+        const feedMins = FEED_SET.has(b.category || '') ? (b.focused_seconds || 0) / 60 : 0;
+        const strainRaw = shortForm * 3 + stimMins * 2 + feedMins * 1.5 + (b.switches || 0) * 0.8;
+        rawStrainByMinute[minuteIdx] = (rawStrainByMinute[minuteIdx] || 0) + strainRaw;
       }
+
+      const totalRawStrain = Object.values(rawStrainByMinute).reduce((s, v) => s + v, 0);
+      const RECOVERY_PER_IDLE_MINUTE = 0.2;  // ~0.2% per idle minute
+
+      // Walk minute-by-minute from session start to now for granular curve
+      const attPoints = [];
+      const stepDetails = [];
+      let att = 100;
+      const startMinuteIdx = Math.floor(startHour * 60);
+      const endMinuteIdx = Math.floor(nowHourFrac * 60);
+      const totalMinutes = Math.max(1, endMinuteIdx - startMinuteIdx);
+      // Use 2-min steps for smooth curve (max ~240 points for 8h); 1-min for shorter sessions
+      const step = totalMinutes <= 120 ? 1 : totalMinutes <= 360 ? 2 : 5;
+
+      for (let m = startMinuteIdx; m <= endMinuteIdx; m += step) {
+        const hourFrac = m / 60;
+        const prevAtt = att;
+        let calc = null;
+        if (m > startMinuteIdx) {
+          const prevM = m - step;
+          let stepRawStrain = 0;
+          const minuteBreakdown = [];
+          for (let i = prevM; i < m; i++) {
+            const r = rawStrainByMinute[i] || 0;
+            stepRawStrain += r;
+            minuteBreakdown.push({ minuteIdx: i, hour: (i / 60).toFixed(2), rawStrain: r });
+          }
+          if (stepRawStrain > 0 && totalRawStrain > 0) {
+            const depletion = (stepRawStrain / totalRawStrain) * dailyStrain;
+            att = Math.max(0, att - depletion);
+            calc = {
+              formula: `depletion = (${stepRawStrain.toFixed(2)} / ${totalRawStrain.toFixed(2)}) * ${dailyStrain} = ${depletion.toFixed(4)}`,
+              prevM, m, stepRawStrain, totalRawStrain, dailyStrain, depletion, prevAtt, att, type: 'deplete',
+              minuteBreakdown
+            };
+          } else {
+            const recovery = RECOVERY_PER_IDLE_MINUTE * (m - prevM);
+            att = Math.min(100, att + recovery);
+            calc = {
+              formula: `recovery = ${RECOVERY_PER_IDLE_MINUTE} * ${m - prevM} = ${recovery.toFixed(4)}`,
+              prevM, m, prevAtt, recovery, att, type: 'recover',
+              minuteBreakdown
+            };
+          }
+          stepDetails.push(calc);
+        } else {
+          calc = { m, hourFrac: (m / 60).toFixed(2), att: 100, type: 'initial' };
+          stepDetails.push(calc);
+        }
+        attPoints.push({ x: hourFrac, y: att, stepIndex: stepDetails.length - 1 });
+      }
+      const lastComputedAtt = attPoints.length > 0 ? attPoints[attPoints.length - 1].y : 100;
+      const jump = Math.abs(lastComputedAtt - attentionNow);
+      // Only force endpoint to match ring when close — avoids fake spike when recovery
+      // pushes curve above ring (different strain formulas can diverge)
+      if (jump <= 5) {
+        attPoints.push({ x: nowHourFrac, y: attentionNow });
+      } else {
+        attPoints.push({ x: nowHourFrac, y: lastComputedAtt });
+      }
+
+      // Debug: log spike if last computed != ring value
+      if (jump > 5) {
+        console.warn('[Attention] Spike detected:', {
+          lastComputedAtt,
+          attentionNow,
+          jump,
+          lastPoint: attPoints[attPoints.length - 2],
+          finalPoint: attPoints[attPoints.length - 1]
+        });
+      }
+      console.log('[Attention] Debug:', {
+        dailyStrain,
+        attentionNow,
+        totalRawStrain,
+        step,
+        startMinuteIdx,
+        endMinuteIdx,
+        pointCount: attPoints.length,
+        lastComputedAtt,
+        jump
+      });
+
+      // Store for export
+      window.__attentionDebugExport = {
+        exportedAt: new Date().toISOString(),
+        spikeDetected: jump > 5,
+        spikeInfo: jump > 5 ? { lastComputedAtt, attentionNow, jump } : null,
+        params: {
+          dailyStrain,
+          attentionNow,
+          totalRawStrain,
+          startHour,
+          endHour,
+          nowHourFrac,
+          startMinuteIdx,
+          endMinuteIdx,
+          step,
+          totalMinutes,
+          RECOVERY_PER_IDLE_MINUTE,
+          sessionHour: res.sessionStart ? new Date(res.sessionStart).getHours() + new Date(res.sessionStart).getMinutes() / 60 : null,
+          firstBucketHour: (() => {
+            const b = buckets.filter(b2 => (b2.focused_seconds || 0) > 10 || (b2.switches || 0) > 0 || (b2.shorts_count || 0) > 0).sort((a, z) => (a.hour ?? 0) - (z.hour ?? 0))[0];
+            return b ? (b.hour ?? null) : null;
+          })()
+        },
+        rawStrainByMinute: Object.fromEntries(
+          Object.entries(rawStrainByMinute).sort((a, b) => Number(a[0]) - Number(b[0]))
+        ),
+        attPoints,
+        stepDetails,
+        // Detect large upward jumps (recovery spikes) and steep drops
+        jumps: (() => {
+          const out = [];
+          for (let i = 1; i < attPoints.length; i++) {
+            const dy = attPoints[i].y - attPoints[i - 1].y;
+            const dx = attPoints[i].x - attPoints[i - 1].x;
+            if (dy > 5) out.push({ kind: 'up', from: attPoints[i - 1], to: attPoints[i], dy, dx, index: i });
+            if (dy < -15 && dx < 0.1) out.push({ kind: 'steep_drop', from: attPoints[i - 1], to: attPoints[i], dy, index: i });
+          }
+          return out;
+        })(),
+        pathSegments: attPoints.slice(0, 5).map((p, i) => ({
+          index: i,
+          ...p,
+          svgX: `xHour(${p.x.toFixed(2)})`,
+          svgY: `y(${p.y.toFixed(2)})`
+        })),
+        buckets: buckets.map(b => ({
+          minute: b.minute,
+          hour: b.hour,
+          category: b.category,
+          url: b.url || null,
+          shorts_count: b.shorts_count,
+          reels_count: b.reels_count,
+          tiktoks_count: b.tiktoks_count,
+          stimulation_seconds: b.stimulation_seconds,
+          youtube_watch_seconds: b.youtube_watch_seconds,
+          focused_seconds: b.focused_seconds,
+          switches: b.switches
+        }))
+      };
 
       // For strain bars (Strain view): scale bars against peak hourly raw strain
-      const maxStrain    = Math.max(0, ...activeData.map(x => x.strain || 0));
+      const activeData = data.filter(x => x.hour >= startHour && x.hour <= Math.floor(nowHourFrac));
+      const maxStrain = Math.max(0, ...activeData.map(x => x.strain || 0));
       const effectiveMax = Math.max(maxStrain, 0.1);
 
-      // Draw path: startHour:00 → each integer hour → now (exact ring value)
-      let pathD = `M ${xHour(startHour)} ${y(attByHour[startHour])}`;
-      for (let h = startHour + 1; h <= lastIntHour; h++) {
-        pathD += ` L ${xHour(h)} ${y(attByHour[h])}`;
+      // Draw path through granular attention points
+      let pathD = `M ${xHour(attPoints[0].x)} ${y(attPoints[0].y)}`;
+      for (let i = 1; i < attPoints.length; i++) {
+        pathD += ` L ${xHour(attPoints[i].x)} ${y(attPoints[i].y)}`;
       }
-      pathD += ` L ${xHour(nowHourFrac)} ${y(attentionNow)}`;
       const areaD = pathD + ` L ${xHour(nowHourFrac)} ${y(0)} L ${xHour(startHour)} ${y(0)} Z`;
 
       // ── Strain bars (Strain mode) ────────────────────────────────────────
@@ -234,7 +391,7 @@ async function loadDashboard() {
           const bh = Math.max(4, (val / effectiveMax) * attnH);
           const bx = xHour(h) + barColW * 0.08;
           const bw = barColW * 0.84;
-          strainBarsFull += `<rect x="${bx}" y="${xAxisY - bh}" width="${bw}" height="${bh}" fill="#e85d75" opacity="0.85"/>`;
+          strainBarsFull += `<rect x="${bx}" y="${xAxisY - bh}" width="${bw}" height="${bh}" fill="#f97316" opacity="0.85"/>`;
         }
       }
 
@@ -256,6 +413,21 @@ async function loadDashboard() {
         if (X_SET.has(b.category || ''))      hourAgg[h].xMins      += (b.focused_seconds || 0) / 60;
       }
 
+      // Buckets by hour+lane for click-to-detail
+      const bucketsByHourLane = {};
+      for (const b of buckets) {
+        const h = b.hour ?? (parseInt(String(b.minute || '0').split(':')[0], 10) || 0);
+        if (h < startHour || h > lastIntHour) continue;
+        if (!bucketsByHourLane[h]) bucketsByHourLane[h] = {};
+        if ((b.shorts_count || 0) > 0) { if (!bucketsByHourLane[h].shorts) bucketsByHourLane[h].shorts = []; bucketsByHourLane[h].shorts.push(b); }
+        if ((b.reels_count || 0) > 0) { if (!bucketsByHourLane[h].reels) bucketsByHourLane[h].reels = []; bucketsByHourLane[h].reels.push(b); }
+        if ((b.tiktoks_count || 0) > 0) { if (!bucketsByHourLane[h].tiktoks) bucketsByHourLane[h].tiktoks = []; bucketsByHourLane[h].tiktoks.push(b); }
+        if ((b.youtube_watch_seconds || 0) > 30) { if (!bucketsByHourLane[h].ytMins) bucketsByHourLane[h].ytMins = []; bucketsByHourLane[h].ytMins.push(b); }
+        if ((b.stimulation_seconds || 0) > 30) { if (!bucketsByHourLane[h].musicMins) bucketsByHourLane[h].musicMins = []; bucketsByHourLane[h].musicMins.push(b); }
+        if (REDDIT_SET.has(b.category || '')) { if (!bucketsByHourLane[h].redditMins) bucketsByHourLane[h].redditMins = []; bucketsByHourLane[h].redditMins.push(b); }
+        if (X_SET.has(b.category || '')) { if (!bucketsByHourLane[h].xMins) bucketsByHourLane[h].xMins = []; bucketsByHourLane[h].xMins.push(b); }
+      }
+
       // ── Swim lanes ──────────────────────────────────────────────────────
       let lanesSvg = '';
       LANES.forEach((lane, idx) => {
@@ -273,19 +445,20 @@ async function loadDashboard() {
         lanesSvg += `<g transform="translate(${iconX},${iconY})">${iconSvg}</g>`;
 
         if (lane.type === 'dot') {
-          // One circle per event at each hour; number inside when count > 1
           for (let h = startHour; h <= lastIntHour; h++) {
             const count = hourAgg[h][lane.key] || 0;
             if (!count) continue;
             const cx = xHour(h) + barColW * 0.5;
             const r  = 5.5;
-            lanesSvg += `<circle cx="${cx.toFixed(1)}" cy="${lCy.toFixed(1)}" r="${r}" fill="${lane.color}" opacity="0.9"/>`;
-            if (count > 1) {
-              lanesSvg += `<text x="${cx.toFixed(1)}" y="${(lCy + 0.5).toFixed(1)}" fill="white" font-size="7" font-weight="700" text-anchor="middle" dominant-baseline="middle">${count}</text>`;
-            }
+            const hitR = 14;
+            const detailBuckets = bucketsByHourLane[h]?.[lane.key] || [];
+            lanesSvg += `<g class="lane-dot-hit" data-lane="${lane.key}" data-hour="${h}" data-label="${lane.label}" style="cursor:pointer">
+              <circle cx="${cx.toFixed(1)}" cy="${lCy.toFixed(1)}" r="${hitR}" fill="transparent"/>
+              <circle cx="${cx.toFixed(1)}" cy="${lCy.toFixed(1)}" r="${r}" fill="${lane.color}" opacity="0.9"/>
+              ${count > 1 ? `<text x="${cx.toFixed(1)}" y="${(lCy + 0.5).toFixed(1)}" fill="white" font-size="7" font-weight="700" text-anchor="middle" dominant-baseline="middle" pointer-events="none">${count}</text>` : ''}
+            </g>`;
           }
         } else {
-          // Heat-map bar: full column width, opacity ∝ fraction of hour spent
           for (let h = startHour; h <= lastIntHour; h++) {
             const mins = hourAgg[h][lane.key] || 0;
             if (mins < 0.3) continue;
@@ -295,7 +468,10 @@ async function loadDashboard() {
             const barH = Math.max(5, fraction * (LANE_H - 8));
             const by  = lCy - barH / 2;
             const opacity = 0.25 + fraction * 0.7;
-            lanesSvg += `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${barH.toFixed(1)}" fill="${lane.color}" opacity="${opacity.toFixed(2)}" rx="2"/>`;
+            const detailBuckets = bucketsByHourLane[h]?.[lane.key] || [];
+            lanesSvg += `<g class="lane-bar-hit" data-lane="${lane.key}" data-hour="${h}" data-label="${lane.label}" data-mins="${mins.toFixed(1)}" style="cursor:pointer">
+              <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${barH.toFixed(1)}" fill="${lane.color}" opacity="${opacity.toFixed(2)}" rx="2"/>
+            </g>`;
           }
         }
       });
@@ -313,22 +489,32 @@ async function loadDashboard() {
           const span = endHour - startHour;
           const tickStep = span <= 4 ? 1 : span <= 10 ? 2 : 3;
           const firstTick = Math.ceil(startHour / tickStep) * tickStep;
+          const nowX = xHour(nowHourFrac);
+          const MIN_LABEL_GAP = 28;
           let axisLabels = '';
           for (let h = firstTick; h <= Math.ceil(endHour); h += tickStep) {
             const tx = xHour(h);
             if (tx < pad.left - 4 || tx > pad.left + plotW + 4) continue;
+            const overlapsNow = h === Math.floor(nowHourFrac) && Math.abs(tx - nowX) < MIN_LABEL_GAP;
             axisLabels += `<line x1="${tx}" y1="${xAxisY}" x2="${tx}" y2="${xAxisY + 4}" stroke="#2a2a2a" stroke-width="1"/>`;
-            axisLabels += `<text x="${tx}" y="${xLabelY}" fill="#a0a0a0" font-size="9" text-anchor="middle">${fmtHour(h)}</text>`;
+            if (!overlapsNow) {
+              axisLabels += `<text x="${tx}" y="${xLabelY}" fill="#a0a0a0" font-size="9" text-anchor="middle">${fmtHour(h)}</text>`;
+            }
           }
-          // "NOW" tick
-          const nowX = xHour(nowHourFrac);
+          // "NOW" tick — when hour label was skipped due to overlap, show "now" at normal position
           axisLabels += `<line x1="${nowX}" y1="${pad.top}" x2="${nowX}" y2="${xAxisY}" stroke="#ffffff" stroke-width="0.5" stroke-dasharray="3,3" opacity="0.25"/>`;
           axisLabels += `<text x="${nowX}" y="${xLabelY}" fill="#a0a0a0" font-size="8" font-weight="600" text-anchor="middle">now</text>`;
+          const attentionColorTop = getAttentionColor(100);
+          const attentionColorBottom = getAttentionColor(0);
           graphEl.innerHTML = `
             <defs>
               <linearGradient id="attentionGradient" x1="0" y1="1" x2="0" y2="0">
-                <stop offset="0%" stop-color="#34c759" stop-opacity="0.35"/>
-                <stop offset="100%" stop-color="#34c759" stop-opacity="0"/>
+                <stop offset="0%" stop-color="${attentionColorBottom}" stop-opacity="0.35"/>
+                <stop offset="100%" stop-color="${attentionColorTop}" stop-opacity="0"/>
+              </linearGradient>
+              <linearGradient id="attentionLineGradient" x1="0" y1="1" x2="0" y2="0">
+                <stop offset="0%" stop-color="${attentionColorBottom}"/>
+                <stop offset="100%" stop-color="${attentionColorTop}"/>
               </linearGradient>
             </defs>
             <g class="axis">
@@ -344,11 +530,54 @@ async function loadDashboard() {
             <g class="strain-bars-full" data-metric-layer="strain" style="display:none">${strainBarsFull || `<text x="${pad.left + plotW / 2}" y="${pad.top + attnH / 2}" fill="#555" font-size="12" text-anchor="middle">No strain data yet</text>`}</g>
             <g class="attention-layer" data-metric-layer="attention">
               <path d="${areaD}" fill="url(#attentionGradient)"/>
-              <path d="${pathD}" fill="none" stroke="#34c759" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="${pathD}" fill="none" stroke="url(#attentionLineGradient)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
             </g>
             <g class="stim-lanes" data-metric-layer="attention">${lanesSvg}</g>
           `;
         })();
+
+      // Clickable lane dots/bars — show activity detail modal
+      graphEl.addEventListener('click', (e) => {
+        const g = e.target.closest('.lane-dot-hit, .lane-bar-hit');
+        if (!g) return;
+        const lane = g.dataset.lane;
+        const hour = parseInt(g.dataset.hour, 10);
+        const label = g.dataset.label || lane;
+        const mins = g.dataset.mins;
+        const detailBuckets = bucketsByHourLane[hour]?.[lane] || [];
+        const modal = document.getElementById('activityModal');
+        const titleEl = document.getElementById('activityModalTitle');
+        const bodyEl = document.getElementById('activityModalBody');
+        if (!modal || !titleEl || !bodyEl) return;
+        function fmtTime(m) {
+          const [hh, mm] = (m || '00:00').split(':').map(Number);
+          const h12 = hh === 0 ? 12 : hh > 12 ? hh - 12 : hh;
+          return `${h12}:${String(mm).padStart(2, '0')}${hh < 12 ? 'a' : 'p'}`;
+        }
+        const hourLabel = hour === 0 ? '12am' : hour === 12 ? '12pm' : hour < 12 ? `${hour}am` : `${hour - 12}pm`;
+        titleEl.textContent = `${label} — ${hourLabel}` + (mins ? ` (${mins}m)` : ` (${detailBuckets.reduce((s, b) => s + (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0), 0)} items)`);
+        if (detailBuckets.length === 0) {
+          bodyEl.innerHTML = '<p style="color:var(--text-dim)">No per-minute breakdown available.</p>';
+        } else {
+          bodyEl.innerHTML = detailBuckets
+            .sort((a, b) => (a.minute || '').localeCompare(b.minute || ''))
+            .map(b => {
+              const cat = (b.category || 'Unknown').replace(/_/g, ' ');
+              const parts = [];
+              if (b.shorts_count) parts.push(`${b.shorts_count} Short${b.shorts_count > 1 ? 's' : ''}`);
+              if (b.reels_count) parts.push(`${b.reels_count} Reel${b.reels_count > 1 ? 's' : ''}`);
+              if (b.tiktoks_count) parts.push(`${b.tiktoks_count} TikTok${b.tiktoks_count > 1 ? 's' : ''}`);
+              if ((b.youtube_watch_seconds || 0) > 30) parts.push(`${Math.round(b.youtube_watch_seconds / 60)}m YT`);
+              if ((b.stimulation_seconds || 0) > 30) parts.push(`${Math.round(b.stimulation_seconds / 60)}m Music`);
+              if ((b.focused_seconds || 0) > 20 && !parts.length) parts.push(`${Math.round(b.focused_seconds / 60)}m`);
+              const displayUrl = b.url ? b.url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').replace(/</g, '&lt;').replace(/"/g, '&quot;') : '';
+              const url = b.url ? `<a href="${b.url.replace(/"/g, '&quot;')}" target="_blank" rel="noopener" class="activity-detail-url" title="${b.url.replace(/"/g, '&quot;')}">${displayUrl}</a>` : '';
+              return `<div class="activity-detail-item"><span>${fmtTime(b.minute)} · ${cat}</span><span>${parts.join(' · ') || '—'}</span>${url ? `<span class="activity-detail-url-wrap">${url}</span>` : ''}</div>`;
+            })
+            .join('');
+        }
+        modal.style.display = 'flex';
+      });
 
       // Update legend
       const legendEl = document.querySelector('.graph-legend');
@@ -430,10 +659,13 @@ async function loadDashboard() {
           if ((b.focused_seconds || 0) > 20 && !tags.length) tags.push(`<span class="log-tag focus">${Math.round(b.focused_seconds / 60)}m focus</span>`);
 
           const cat = (b.category || 'UNKNOWN').replace(/_/g, ' ');
+          const displayUrl = b.url ? b.url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').replace(/</g, '&lt;').replace(/"/g, '&quot;') : '';
+          const url = b.url ? `<a href="${b.url.replace(/"/g, '&quot;')}" target="_blank" rel="noopener" class="log-url" title="${b.url.replace(/"/g, '&quot;')}">${displayUrl}</a>` : '';
           html += `<div class="log-bucket">
             <span class="log-time">${fmtMin(b.minute)}</span>
             <span class="log-category">${cat}</span>
             <span class="log-tags">${tags.join('')}</span>
+            ${url ? `<span class="log-url-wrap">${url}</span>` : ''}
           </div>`;
         }
         html += '</div>';
@@ -475,3 +707,34 @@ async function loadDashboard() {
 }
 
 loadDashboard();
+
+// Debug export — always attached so it works even if graph block fails
+document.getElementById('debugExportBtn')?.addEventListener('click', () => {
+  const data = window.__attentionDebugExport;
+  if (!data) {
+    alert('No debug data yet. Refresh the dashboard first.');
+    return;
+  }
+  try {
+    const json = JSON.stringify(data, null, 2);
+    const filename = `attention-debug-${new Date().toISOString().slice(0, 10)}.json`;
+    const a = document.createElement('a');
+    a.download = filename;
+    a.style.display = 'none';
+    a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(json);
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } catch (err) {
+    console.error('Export failed:', err);
+    alert('Export failed. Check console for details.');
+  }
+});
+
+// Modal close handlers (once)
+document.getElementById('activityModalBackdrop')?.addEventListener('click', () => {
+  document.getElementById('activityModal').style.display = 'none';
+});
+document.getElementById('activityModalClose')?.addEventListener('click', () => {
+  document.getElementById('activityModal').style.display = 'none';
+});

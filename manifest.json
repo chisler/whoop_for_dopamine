@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Whoop for Dopamine",
+  "name": "WHOOPAMINE",
   "version": "0.1.0",
   "description": "Track dopamine strain and focus — local-only productivity insights",
   "permissions": ["tabs", "activeTab", "storage", "idle", "scripting", "windows"],

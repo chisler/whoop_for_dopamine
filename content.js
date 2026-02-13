@@ -22,6 +22,7 @@ function sendEvent(type, payload = {}) {
     type: 'CONTENT_EVENT',
     event: type,
     domain: getDomain(),
+    url: window.location.href,
     ...payload
   }).catch(() => {});
 }
@@ -57,7 +58,7 @@ window.addEventListener('scroll', onScroll, { passive: true });
 // --- Media / short-form tracking ---
 
 function isYouTubeShorts() {
-  return /youtube\.com\/shorts\//i.test(window.location.href);
+  return /youtube\.com\/shorts/i.test(window.location.href);
 }
 
 function isInstagramReels() {
@@ -101,7 +102,7 @@ function setupShortFormTracking() {
     const now = Date.now();
     if (now - lastCountAt < DEBOUNCE_MS) return;
     lastCountAt = now;
-    sendEvent('short_watched', { source });
+    sendEvent('short_watched', { source, url: window.location.href });
   }
 
   function onVideoEnded() {
