@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dopamine Dashboard — Whoop for Dopamine</title>
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <div class="dashboard">
+    <header>
+      <h1>WHOOP</h1>
+      <p class="subtitle">for STIMULATION</p>
+    </header>
+
+    <section class="rings">
+      <div class="ring-card">
+        <div class="ring-wrap">
+          <svg class="ring" viewBox="0 0 100 100">
+            <circle class="ring-bg" cx="50" cy="50" r="44" />
+            <circle class="ring-fill strain" cx="50" cy="50" r="44" id="strain-ring" />
+          </svg>
+          <div class="ring-value">
+            <span id="strain">—</span>
+          </div>
+        </div>
+        <span class="ring-label">STIMULATION STRAIN</span>
+      </div>
+      <div class="ring-card">
+        <div class="ring-wrap">
+          <svg class="ring" viewBox="0 0 100 100">
+            <circle class="ring-bg" cx="50" cy="50" r="44" />
+            <circle class="ring-fill focus" cx="50" cy="50" r="44" id="focus-ring" />
+          </svg>
+          <div class="ring-value">
+            <span id="focus">—</span><span class="unit" id="focus-unit">%</span>
+          </div>
+        </div>
+        <span class="ring-label">ATTENTION SPAN</span>
+      </div>
+      <div class="ring-card">
+        <div class="ring-wrap">
+          <svg class="ring" viewBox="0 0 100 100">
+            <circle class="ring-bg" cx="50" cy="50" r="44" />
+            <circle class="ring-fill block" cx="50" cy="50" r="44" id="block-ring" />
+          </svg>
+          <div class="ring-value">
+            <span id="block">—</span><span class="unit">m</span>
+          </div>
+        </div>
+        <span class="ring-label">LONGEST BLOCK</span>
+      </div>
+    </section>
+
+    <section class="stimulation-timeline">
+      <h2>TIMELINE</h2>
+      <p class="timeline-hint" id="sessionHint">Body battery style: attention depletes with stimulation, recovers when idle.</p>
+      <div class="graph-filters">
+        <button class="filter-btn active" data-metric="attention">Attention</button>
+        <button class="filter-btn" data-metric="strain">Strain</button>
+      </div>
+      <div class="graph-container">
+        <svg class="attention-graph" id="attentionGraph" viewBox="0 0 420 220" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="graph-legend">
+        <span class="legend-item"><span class="legend-line attention"></span> Attention</span>
+        <span class="legend-item"><span class="legend-bar strain"></span> Strain</span>
+      </div>
+    </section>
+
+    <section class="context-switch" id="contextSwitchSection">
+      <div class="context-switch-card">
+        <span class="context-switch-label">CONTEXT SWITCHES</span>
+        <span class="context-switch-value" id="contextSwitches">0</span>
+      </div>
+    </section>
+
+    <section class="strain-breakdown" id="strainBreakdownSection">
+      <h2>CULPRITS — WHAT DROVE YOUR STRAIN</h2>
+      <ul id="strainBreakdown"></ul>
+    </section>
+
+    <section class="activity-log">
+      <button class="activity-log-toggle" id="activityLogToggle" aria-expanded="false">
+        <span id="activityLogTitle">ACTIVITY LOG</span>
+        <span class="toggle-arrow" id="toggleArrow">▸</span>
+      </button>
+      <div class="activity-log-body" id="activityLogBody" style="display:none">
+        <div id="activityLogContent"></div>
+      </div>
+    </section>
+
+    <footer>
+      <p class="privacy">Local-only · Nothing uploaded</p>
+    </footer>
+  </div>
+  <script src="dashboard.js"></script>
+</body>
+</html>
