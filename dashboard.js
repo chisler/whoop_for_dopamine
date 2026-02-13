@@ -427,32 +427,66 @@ async function loadDashboard() {
       for (let h = 0; h < 24; h++) {
         hourAgg[h] = { shorts: 0, reels: 0, tiktoks: 0, musicMins: 0, ytMins: 0, redditMins: 0, xMins: 0 };
       }
+      const minuteAgg = {};
       const REDDIT_SET = new Set(['REDDIT_FEED','REDDIT_THREAD']);
       const X_SET      = new Set(['X_HOME','X_SEARCH','X_OTHER','X_THREAD']);
       for (const b of buckets) {
         const h = b.hour ?? (parseInt(String(b.minute || '0').split(':')[0], 10) || 0);
+        const [hh, mm] = String(b.minute || '00:00').split(':').map(v => parseInt(v, 10) || 0);
+        const minuteIdx = hh * 60 + mm;
+        if (!minuteAgg[minuteIdx]) {
+          minuteAgg[minuteIdx] = { musicMins: 0, ytMins: 0, redditMins: 0, xMins: 0 };
+        }
         hourAgg[h].shorts    += b.shorts_count || 0;
         hourAgg[h].reels     += b.reels_count  || 0;
         hourAgg[h].tiktoks   += b.tiktoks_count || 0;
         hourAgg[h].musicMins += (b.stimulation_seconds   || 0) / 60;
         hourAgg[h].ytMins    += (b.youtube_watch_seconds || 0) / 60;
+        minuteAgg[minuteIdx].musicMins += (b.stimulation_seconds   || 0) / 60;
+        minuteAgg[minuteIdx].ytMins    += (b.youtube_watch_seconds || 0) / 60;
         if (REDDIT_SET.has(b.category || '')) hourAgg[h].redditMins += (b.focused_seconds || 0) / 60;
         if (X_SET.has(b.category || ''))      hourAgg[h].xMins      += (b.focused_seconds || 0) / 60;
+        if (REDDIT_SET.has(b.category || '')) minuteAgg[minuteIdx].redditMins += (b.focused_seconds || 0) / 60;
+        if (X_SET.has(b.category || ''))      minuteAgg[minuteIdx].xMins      += (b.focused_seconds || 0) / 60;
       }
 
       // Buckets by hour+lane for click-to-detail
       const bucketsByHourLane = {};
+      const bucketsByMinuteLane = {};
       for (const b of buckets) {
         const h = b.hour ?? (parseInt(String(b.minute || '0').split(':')[0], 10) || 0);
+        const [hh, mm] = String(b.minute || '00:00').split(':').map(v => parseInt(v, 10) || 0);
+        const minuteIdx = hh * 60 + mm;
         if (h < startHour || h > lastIntHour) continue;
         if (!bucketsByHourLane[h]) bucketsByHourLane[h] = {};
+        if (!bucketsByMinuteLane[minuteIdx]) bucketsByMinuteLane[minuteIdx] = {};
         if ((b.shorts_count || 0) > 0) { if (!bucketsByHourLane[h].shorts) bucketsByHourLane[h].shorts = []; bucketsByHourLane[h].shorts.push(b); }
         if ((b.reels_count || 0) > 0) { if (!bucketsByHourLane[h].reels) bucketsByHourLane[h].reels = []; bucketsByHourLane[h].reels.push(b); }
         if ((b.tiktoks_count || 0) > 0) { if (!bucketsByHourLane[h].tiktoks) bucketsByHourLane[h].tiktoks = []; bucketsByHourLane[h].tiktoks.push(b); }
-        if ((b.youtube_watch_seconds || 0) > 5) { if (!bucketsByHourLane[h].ytMins) bucketsByHourLane[h].ytMins = []; bucketsByHourLane[h].ytMins.push(b); }
-        if ((b.stimulation_seconds || 0) > 5) { if (!bucketsByHourLane[h].musicMins) bucketsByHourLane[h].musicMins = []; bucketsByHourLane[h].musicMins.push(b); }
-        if (REDDIT_SET.has(b.category || '')) { if (!bucketsByHourLane[h].redditMins) bucketsByHourLane[h].redditMins = []; bucketsByHourLane[h].redditMins.push(b); }
-        if (X_SET.has(b.category || '')) { if (!bucketsByHourLane[h].xMins) bucketsByHourLane[h].xMins = []; bucketsByHourLane[h].xMins.push(b); }
+        if ((b.youtube_watch_seconds || 0) > 5) {
+          if (!bucketsByHourLane[h].ytMins) bucketsByHourLane[h].ytMins = [];
+          bucketsByHourLane[h].ytMins.push(b);
+          if (!bucketsByMinuteLane[minuteIdx].ytMins) bucketsByMinuteLane[minuteIdx].ytMins = [];
+          bucketsByMinuteLane[minuteIdx].ytMins.push(b);
+        }
+        if ((b.stimulation_seconds || 0) > 5) {
+          if (!bucketsByHourLane[h].musicMins) bucketsByHourLane[h].musicMins = [];
+          bucketsByHourLane[h].musicMins.push(b);
+          if (!bucketsByMinuteLane[minuteIdx].musicMins) bucketsByMinuteLane[minuteIdx].musicMins = [];
+          bucketsByMinuteLane[minuteIdx].musicMins.push(b);
+        }
+        if (REDDIT_SET.has(b.category || '')) {
+          if (!bucketsByHourLane[h].redditMins) bucketsByHourLane[h].redditMins = [];
+          bucketsByHourLane[h].redditMins.push(b);
+          if (!bucketsByMinuteLane[minuteIdx].redditMins) bucketsByMinuteLane[minuteIdx].redditMins = [];
+          bucketsByMinuteLane[minuteIdx].redditMins.push(b);
+        }
+        if (X_SET.has(b.category || '')) {
+          if (!bucketsByHourLane[h].xMins) bucketsByHourLane[h].xMins = [];
+          bucketsByHourLane[h].xMins.push(b);
+          if (!bucketsByMinuteLane[minuteIdx].xMins) bucketsByMinuteLane[minuteIdx].xMins = [];
+          bucketsByMinuteLane[minuteIdx].xMins.push(b);
+        }
       }
 
       // ── Swim lanes ──────────────────────────────────────────────────────
@@ -486,17 +520,24 @@ async function loadDashboard() {
             </g>`;
           }
         } else {
-          for (let h = startHour; h <= lastIntHour; h++) {
-            const mins = hourAgg[h][lane.key] || 0;
-            if (mins < 0.05) continue;
-            const fraction = Math.min(1, mins / 60);
-            const bx = xHour(h) + 1;
-            const bw = barColW - 2;
+          const minuteEntries = Object.entries(minuteAgg)
+            .map(([idx, agg]) => [parseInt(idx, 10), agg])
+            .sort((a, b) => a[0] - b[0]);
+          for (const [minuteIdx, agg] of minuteEntries) {
+            const mins = agg[lane.key] || 0;
+            if (mins < 0.02) continue;
+            const minuteStartHour = minuteIdx / 60;
+            const minuteEndHour = (minuteIdx + 1) / 60;
+            const segStart = Math.max(startHour, minuteStartHour);
+            const segEnd = Math.min(nowHourFrac, minuteEndHour);
+            if (segEnd <= segStart) continue;
+            const fraction = Math.min(1, mins);
+            const bx = xHour(segStart) + 0.5;
+            const bw = Math.max(1, xHour(segEnd) - xHour(segStart) - 1);
             const barH = Math.max(5, fraction * (LANE_H - 8));
             const by  = lCy - barH / 2;
             const opacity = 0.25 + fraction * 0.7;
-            const detailBuckets = bucketsByHourLane[h]?.[lane.key] || [];
-            lanesSvg += `<g class="lane-bar-hit" data-lane="${lane.key}" data-hour="${h}" data-label="${lane.label}" data-mins="${mins.toFixed(1)}" style="cursor:pointer">
+            lanesSvg += `<g class="lane-bar-hit" data-lane="${lane.key}" data-minute="${minuteIdx}" data-label="${lane.label}" data-mins="${mins.toFixed(2)}" style="cursor:pointer">
               <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${barH.toFixed(1)}" fill="${lane.color}" opacity="${opacity.toFixed(2)}" rx="2"/>
             </g>`;
           }
@@ -569,9 +610,12 @@ async function loadDashboard() {
         if (!g) return;
         const lane = g.dataset.lane;
         const hour = parseInt(g.dataset.hour, 10);
+        const minuteIdx = g.dataset.minute != null ? parseInt(g.dataset.minute, 10) : null;
         const label = g.dataset.label || lane;
         const mins = g.dataset.mins;
-        const detailBuckets = bucketsByHourLane[hour]?.[lane] || [];
+        const detailBuckets = minuteIdx != null
+          ? (bucketsByMinuteLane[minuteIdx]?.[lane] || [])
+          : (bucketsByHourLane[hour]?.[lane] || []);
         const modal = document.getElementById('activityModal');
         const titleEl = document.getElementById('activityModalTitle');
         const bodyEl = document.getElementById('activityModalBody');
@@ -582,7 +626,15 @@ async function loadDashboard() {
           return `${h12}:${String(mm).padStart(2, '0')}${hh < 12 ? 'a' : 'p'}`;
         }
         const hourLabel = hour === 0 ? '12am' : hour === 12 ? '12pm' : hour < 12 ? `${hour}am` : `${hour - 12}pm`;
-        titleEl.textContent = `${label} — ${hourLabel}` + (mins ? ` (${mins}m)` : ` (${detailBuckets.reduce((s, b) => s + (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0), 0)} items)`);
+        const minuteLabel = minuteIdx != null
+          ? `${(() => {
+              const hh = Math.floor(minuteIdx / 60);
+              const mm = minuteIdx % 60;
+              const h12 = hh === 0 ? 12 : hh > 12 ? hh - 12 : hh;
+              return `${h12}:${String(mm).padStart(2, '0')}${hh < 12 ? 'a' : 'p'}`;
+            })()}`
+          : hourLabel;
+        titleEl.textContent = `${label} — ${minuteLabel}` + (mins ? ` (${(Math.round(parseFloat(mins) * 10) / 10)}m)` : ` (${detailBuckets.reduce((s, b) => s + (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0), 0)} items)`);
         if (detailBuckets.length === 0) {
           bodyEl.innerHTML = '<p style="color:var(--text-dim)">No per-minute breakdown available.</p>';
         } else {
