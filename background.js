@@ -3,7 +3,7 @@
  */
 
 import { classifyUrl } from './url-classifier.js';
-import { addEvent, getBucketsForDate, getBucketsInRange, getEventsForDate } from './storage.js';
+import { addEvent, getBucketsForDate, getBucketsInRange, getEventsForDate, getHeartRateForDate } from './storage.js';
 import { getDomainFromUrl, getLocalDateStr } from './tracking/time.js';
 import { createTrackerRuntime } from './tracking/runtime.js';
 import { computeDopamineStrain, computeFocusMinutes, computeStrainBreakdown } from './tracking/scoring.js';
@@ -47,7 +47,8 @@ async function onTabActivated(activeInfo) {
     category: classifyUrl(next.activeTabUrl),
     url: next.activeTabUrl || null,
     tabId: activeInfo.tabId,
-    ts: now
+    ts: now,
+    date: getLocalDateStr(new Date(now))
   });
 
   await ensureSessionStart(now);
@@ -85,7 +86,7 @@ async function onWindowFocusChanged(windowId) {
 
   runtime.setWindowFocused(!!focused);
   await runtime.saveState();
-  await addEvent({ type: 'window_focus', focused });
+  await addEvent({ type: 'window_focus', focused, ts: Date.now(), date: getLocalDateStr() });
 }
 
 function getVisitsWithFallback(events) {
@@ -117,16 +118,22 @@ async function queryFallbackVisit() {
   }];
 }
 
-async function buildDashboardPayload() {
-  await runtime.accrueActiveTime(Date.now(), { forceSave: true });
-  await runtime.flushBucket();
-
+async function buildDashboardPayload(requestDate = null) {
   const today = getLocalDateStr();
-  const buckets = await getBucketsForDate(today);
-  const events = await getEventsForDate(today);
+  const targetDate = requestDate || today;
 
-  const sessionKey = `sessionStart_${today}`;
+  if (targetDate === today) {
+    await runtime.accrueActiveTime(Date.now(), { forceSave: true });
+    await runtime.flushBucket();
+  }
+
+  const buckets = await getBucketsForDate(targetDate);
+  const events = await getEventsForDate(targetDate);
+
+  const sessionKey = `sessionStart_${targetDate}`;
   const { [sessionKey]: sessionStart } = await chrome.storage.local.get(sessionKey);
+
+  const heartRate = await getHeartRateForDate(targetDate);
 
   let visits = getVisitsWithFallback(events);
   if (visits.length === 0) {
@@ -167,6 +174,9 @@ async function buildDashboardPayload() {
     .sort((a, b) => a.date.localeCompare(b.date));
 
   return {
+    date: targetDate,
+    isToday: targetDate === today,
+    heartRate,
     today: {
       strain,
       focusMinutes: totalFocus,
@@ -175,7 +185,7 @@ async function buildDashboardPayload() {
     },
     strainBreakdown,
     trend,
-    sessionStart: sessionStart || null,
+    sessionStart: targetDate === today ? (sessionStart || null) : null,
     visits,
     buckets: ensureHourOnBuckets(enrichedBuckets),
     hourlyTimeline: buildHourlyTimeline(enrichedBuckets)
@@ -192,7 +202,8 @@ async function buildExportPayload() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_DASHBOARD') {
-    buildDashboardPayload().then(sendResponse).catch(() => sendResponse(null));
+    const requestDate = (msg && typeof msg.date === 'string') ? msg.date : null;
+    buildDashboardPayload(requestDate).then(sendResponse).catch(() => sendResponse(null));
     return true;
   }
 
@@ -235,7 +246,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     category: classifyUrl(url),
     url,
     tabId,
-    ts: Date.now()
+    ts: Date.now(),
+    date: getLocalDateStr()
   });
 });
 

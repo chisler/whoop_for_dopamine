@@ -4,8 +4,8 @@
  */
 
 const DB_NAME = 'whoop-dopamine';
-const DB_VERSION = 1;
-const STORES = { events: 'events', buckets: 'buckets' };
+const DB_VERSION = 2;
+const STORES = { events: 'events', buckets: 'buckets', heartRate: 'heartRate' };
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -22,16 +22,28 @@ function openDB() {
         bucketStore.createIndex('date', 'date', { unique: false });
         bucketStore.createIndex('minute', 'minute', { unique: false });
       }
+      if (!db.objectStoreNames.contains('heartRate')) {
+        db.createObjectStore('heartRate', { keyPath: 'date' });
+      }
     };
   });
+}
+
+function tsToDateStr(ts) {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 export async function addEvent(event) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const ts = event.ts ?? Date.now();
+    const date = event.date ?? tsToDateStr(ts);
     const tx = db.transaction('events', 'readwrite');
-    tx.objectStore('events').add({ ...event, ts });
+    tx.objectStore('events').add({ ...event, ts, date });
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => reject(tx.error);
   });
@@ -117,6 +129,54 @@ export async function getBucketsInRange(startDate, endDate) {
       db.close();
       resolve(buckets);
     };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export function parseGarminHeartRate(json) {
+  let data;
+  try {
+    const str = typeof json === 'string' ? json.replace(/^\uFEFF/, '').trim() : json;
+    data = typeof str === 'string' ? JSON.parse(str) : str;
+  } catch (e) {
+    throw new Error('Invalid JSON: ' + (e?.message || 'parse error'));
+  }
+  const values = data.heartRateValues || [];
+  const firstTs = values[0]?.[0];
+  const dateStr = data.calendarDate || (firstTs ? (() => {
+    const d = new Date(firstTs);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  })() : null);
+  const heartRateValues = values
+    .filter(([ts]) => ts && typeof ts === 'number')
+    .map(([ts, hr]) => [ts, typeof hr === 'number' ? hr : 0]);
+  return {
+    date: dateStr,
+    calendarDate: data.calendarDate,
+    maxHeartRate: data.maxHeartRate,
+    minHeartRate: data.minHeartRate,
+    restingHeartRate: data.restingHeartRate,
+    heartRateValues
+  };
+}
+
+export async function saveHeartRate(dateStr, data) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const record = { date: dateStr, ...data };
+    const tx = db.transaction('heartRate', 'readwrite');
+    tx.objectStore('heartRate').put(record);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getHeartRateForDate(dateStr) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('heartRate', 'readonly');
+    const req = tx.objectStore('heartRate').get(dateStr);
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
     req.onerror = () => reject(req.error);
   });
 }

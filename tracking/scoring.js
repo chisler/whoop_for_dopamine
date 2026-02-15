@@ -1,5 +1,7 @@
-import { isFeedCategory } from '../url-classifier.js';
+import { isFeedCategory, isStimulationCategory } from '../url-classifier.js';
 import { isLateNight } from './time.js';
+
+const WORK_OR_READ_CATEGORIES = new Set(['DOCS_WORK', 'REDDIT_THREAD', 'X_THREAD', 'OTHER', 'UNKNOWN']);
 
 function inferShortsCount(bucket) {
   const explicit = bucket.shorts_count || 0;
@@ -14,19 +16,43 @@ export function computeDopamineStrain(buckets) {
   let totalShorts = 0;
   let totalReels = 0;
   let totalTiktoks = 0;
-  let totalStimSeconds = 0;
-  let totalYtWatchSeconds = 0;
+  let backgroundMusicMins = 0;
+  let activeStimMins = 0;
   let totalFeedSeconds = 0;
   let fragmentationMinutes = 0;
+  let totalSwitches = 0;
   let lateNightActiveMinutes = 0;
 
   for (const b of buckets) {
     totalShorts += inferShortsCount(b);
     totalReels += b.reels_count || 0;
     totalTiktoks += b.tiktoks_count || 0;
-    totalStimSeconds += b.stimulation_seconds || 0;
-    totalYtWatchSeconds += b.youtube_watch_seconds || 0;
-    if (isFeedCategory(b.category)) totalFeedSeconds += b.focused_seconds || 0;
+    totalSwitches += b.switches || 0;
+
+    const cat = b.category || 'UNKNOWN';
+    const stimSec = b.stimulation_seconds || 0;
+    const ytSec = b.youtube_watch_seconds || 0;
+    const isMusicTab = isStimulationCategory(cat);
+    const isWorkOrRead = WORK_OR_READ_CATEGORIES.has(cat);
+
+    if (stimSec > 0) {
+      if (isMusicTab) {
+        activeStimMins += stimSec / 60;
+      } else if (isWorkOrRead) {
+        backgroundMusicMins += stimSec / 60;
+      } else {
+        activeStimMins += stimSec / 60;
+      }
+    }
+    if (ytSec > 0) {
+      if (cat === 'YOUTUBE_WATCH') {
+        activeStimMins += ytSec / 60;
+      } else {
+        backgroundMusicMins += ytSec / 60;
+      }
+    }
+
+    if (isFeedCategory(cat)) totalFeedSeconds += b.focused_seconds || 0;
 
     const isFragmented =
       (b.focused_seconds > 0 && b.focused_seconds < 90) ||
@@ -46,16 +72,17 @@ export function computeDopamineStrain(buckets) {
   const shortFormTotal = totalShorts + totalReels + totalTiktoks;
   const shortFormScore = Math.min(20, 2.2 * Math.sqrt(shortFormTotal));
 
-  const stimMins = (totalStimSeconds + totalYtWatchSeconds) / 60;
-  const stimScore = Math.min(14, 1.8 * Math.sqrt(stimMins));
+  const effectiveStimMins = backgroundMusicMins * 0.35 + activeStimMins;
+  const stimScore = Math.min(14, 1.8 * Math.sqrt(Math.max(0, effectiveStimMins)));
 
   const feedMins = totalFeedSeconds / 60;
   const feedScore = Math.min(14, 1.8 * Math.sqrt(feedMins));
 
   const fragScore = Math.min(10, 1.2 * Math.sqrt(fragmentationMinutes));
+  const switchScore = Math.min(10, 0.2 * Math.sqrt(totalSwitches));
   const lateScore = Math.min(8, 0.4 * lateNightActiveMinutes);
 
-  const raw = shortFormScore + stimScore + feedScore + fragScore + lateScore;
+  const raw = shortFormScore + stimScore + feedScore + fragScore + switchScore + lateScore;
   const score = Math.round(100 * (1 - Math.exp(-raw / 25)));
   return Math.min(100, score);
 }
@@ -66,9 +93,12 @@ export function computeStrainBreakdown(buckets) {
     const shorts = inferShortsCount(b);
     const reels = b.reels_count || 0;
     const tiktoks = b.tiktoks_count || 0;
-    const stimMins = (b.stimulation_seconds || 0) / 60;
-    const ytMins = (b.youtube_watch_seconds || 0) / 60;
-    const feedMins = isFeedCategory(b.category) ? b.focused_seconds / 60 : 0;
+    const stimSec = b.stimulation_seconds || 0;
+    const ytSec = b.youtube_watch_seconds || 0;
+    const cat = b.category || 'UNKNOWN';
+    const stimMins = stimSec / 60;
+    const ytMins = ytSec / 60;
+    const feedMins = isFeedCategory(cat) ? (b.focused_seconds || 0) / 60 : 0;
     const shortSessions = (b.focused_seconds > 0 && b.focused_seconds < 90) ? 1 : 0;
     const highSwitch = b.switches >= 4 ? 1 : 0;
     const highScroll = (b.scrolls > 20 || b.scroll_distance > 2000) ? 1 : 0;
@@ -77,11 +107,20 @@ export function computeStrainBreakdown(buckets) {
     breakdown.youtubeShorts = (breakdown.youtubeShorts || 0) + shorts;
     breakdown.instagramReels = (breakdown.instagramReels || 0) + reels;
     breakdown.tiktoks = (breakdown.tiktoks || 0) + tiktoks;
-    breakdown.musicMinutes = (breakdown.musicMinutes || 0) + stimMins;
+    if (stimSec > 0) {
+      if (isStimulationCategory(cat)) {
+        breakdown.musicMinutes = (breakdown.musicMinutes || 0) + stimMins;
+      } else if (WORK_OR_READ_CATEGORIES.has(cat)) {
+        breakdown.backgroundMusicMinutes = (breakdown.backgroundMusicMinutes || 0) + stimMins;
+      } else {
+        breakdown.musicMinutes = (breakdown.musicMinutes || 0) + stimMins;
+      }
+    }
     breakdown.youtubeWatchMinutes = (breakdown.youtubeWatchMinutes || 0) + ytMins;
     breakdown.feedMinutes = (breakdown.feedMinutes || 0) + feedMins;
     breakdown.shortSessions = (breakdown.shortSessions || 0) + shortSessions;
     breakdown.highSwitchMinutes = (breakdown.highSwitchMinutes || 0) + highSwitch;
+    breakdown.tabSwitches = (breakdown.tabSwitches || 0) + (b.switches || 0);
     breakdown.highScrollMinutes = (breakdown.highScrollMinutes || 0) + highScroll;
     breakdown.lateNightMinutes = (breakdown.lateNightMinutes || 0) + lateNight;
   }

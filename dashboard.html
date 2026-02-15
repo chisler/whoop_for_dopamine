@@ -9,6 +9,11 @@
 <body>
   <div class="dashboard">
     <header>
+      <div class="date-nav">
+        <button type="button" class="date-nav-btn" id="datePrev" aria-label="Previous day">‹</button>
+        <span class="date-label" id="dateLabel">Today</span>
+        <button type="button" class="date-nav-btn" id="dateNext" aria-label="Next day">›</button>
+      </div>
       <h1>WHOOPAMINE</h1>
       <p class="subtitle">Whoop for tracking overstimulation</p>
     </header>
@@ -54,7 +59,7 @@
 
     <section class="stimulation-timeline">
       <h2>TIMELINE</h2>
-      <p class="timeline-hint" id="sessionHint">Body battery style: attention depletes with stimulation, recovers when idle.</p>
+      <p class="timeline-hint" id="sessionHint">Attention depletes with feeds & short-form; recovers when idle or during focused work (docs, long-form reading).</p>
       <div class="graph-filters">
         <button class="filter-btn active" data-metric="attention">Attention</button>
         <button class="filter-btn" data-metric="strain">Strain</button>
@@ -90,6 +95,23 @@
       </div>
     </section>
 
+    <section class="heart-rate-import">
+      <button class="heart-rate-toggle" id="heartRateToggle" aria-expanded="false">
+        <span>IMPORT HEART RATE (Garmin JSON)</span>
+        <span class="toggle-arrow" id="heartRateToggleArrow">▸</span>
+      </button>
+      <div class="heart-rate-body" id="heartRateBody" style="display:none">
+        <p class="heart-rate-hint">Paste Garmin heart rate JSON or drop files here (multiple supported). Date is derived from timestamps.</p>
+        <div class="heart-rate-drop-zone" id="heartRateDropZone">
+          <input type="file" id="heartRateFileInput" accept=".json,application/json" multiple hidden>
+          <span class="heart-rate-drop-text">Drop files or <button type="button" class="heart-rate-browse-btn" id="heartRateBrowseBtn">browse</button></span>
+        </div>
+        <textarea id="heartRateJson" placeholder='{"calendarDate":"2026-02-14","heartRateValues":[[ts,hr],...],...}' rows="6"></textarea>
+        <button type="button" class="heart-rate-save-btn" id="heartRateSaveBtn">Save</button>
+        <p class="heart-rate-status" id="heartRateStatus"></p>
+      </div>
+    </section>
+
     <footer>
       <p class="privacy">Local-only · Nothing uploaded</p>
       <button type="button" class="debug-export-btn" id="debugExportBtn">Export debug JSON</button>
@@ -104,6 +126,6 @@
       <button type="button" class="activity-modal-close" id="activityModalClose">Close</button>
     </div>
   </div>
-  <script src="dashboard.js"></script>
+  <script type="module" src="dashboard.js"></script>
 </body>
 </html>

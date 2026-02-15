@@ -1,0 +1,11 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Garmin export - credentials & personal data
+.env
+garmin_session/
+garmin_hr_json/

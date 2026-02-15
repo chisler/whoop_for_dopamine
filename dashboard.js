@@ -2,9 +2,16 @@
  * Dashboard — Stimulation Strain, culprits, single timeline
  */
 
+let _storage = null;
+async function getStorage() {
+  if (!_storage) _storage = await import('./storage.js');
+  return _storage;
+}
+
 const RING_CIRCUMFERENCE = 2 * Math.PI * 44;
 const DASHBOARD_REFRESH_MS = 5000;
 let dashboardLoadInFlight = false;
+let selectedDate = getLocalDateStr();
 
 const ICONS = {
   // Brand icons with proper colors — used in swim lanes and culprit list
@@ -27,11 +34,13 @@ const STRAIN_LABELS = {
   youtubeShorts: 'YouTube Shorts watched',
   instagramReels: 'IG Reels watched',
   tiktoks: 'TikToks watched',
-  musicMinutes: 'Music (Spotify etc)',
+  musicMinutes: 'Music (active)',
+  backgroundMusicMinutes: 'Music (background)',
   youtubeWatchMinutes: 'YouTube videos playing',
   feedMinutes: 'Feed scrolling',
   shortSessions: 'Short sessions (<90s)',
   highSwitchMinutes: 'High tab switching',
+  tabSwitches: 'Tab switches',
   highScrollMinutes: 'High scroll density',
   lateNightMinutes: 'Late-night usage'
 };
@@ -41,10 +50,12 @@ const CULPRIT_ICONS = {
   instagramReels: 'instagram',
   tiktoks: 'tiktok',
   musicMinutes: 'spotify',
+  backgroundMusicMinutes: 'spotify',
   youtubeWatchMinutes: 'youtube',
   feedMinutes: 'feed',
   shortSessions: 'short',
   highSwitchMinutes: 'switch',
+  tabSwitches: 'switch',
   highScrollMinutes: 'scroll',
   lateNightMinutes: 'late'
 };
@@ -69,14 +80,46 @@ function getAttentionColor(pct) {
   return `hsl(${hue}, 55%, 48%)`;
 }
 
-async function loadDashboard() {
+function formatDateLabel(dateStr) {
+  const today = getLocalDateStr();
+  if (dateStr === today) return 'Today';
+  const d = new Date(dateStr + 'T12:00:00');
+  const yesterday = getLocalDateStr(new Date(Date.now() - 86400000));
+  if (dateStr === yesterday) return 'Yesterday';
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+async function loadDashboard(forceDate = null) {
   if (dashboardLoadInFlight) return;
   dashboardLoadInFlight = true;
+  const dateToLoad = forceDate ?? selectedDate;
   try {
-    const res = await chrome.runtime.sendMessage({ type: 'GET_DASHBOARD' });
-    if (!res) return;
+    let res;
+    try {
+      res = await chrome.runtime.sendMessage({ type: 'GET_DASHBOARD', date: dateToLoad });
+    } catch (msgErr) {
+      console.warn('GET_DASHBOARD failed (extension may be reloading):', msgErr);
+      res = null;
+    }
+    if (!res) {
+      res = { date: dateToLoad, isToday: dateToLoad === getLocalDateStr(), today: { strain: 0, focusMinutes: 0, longestBlock: 0, totalSwitches: 0 }, buckets: [], strainBreakdown: [], visits: [], hourlyTimeline: [] };
+    }
+    // Ensure res.today exists (background may return malformed data)
+    if (!res.today) {
+      res.today = { strain: 0, focusMinutes: 0, longestBlock: 0, totalSwitches: 0 };
+    }
+    // Fetch heart rate directly from IndexedDB (avoids service worker context issues)
+    try {
+      const storage = await getStorage();
+      const heartRate = await storage.getHeartRateForDate(res.date || dateToLoad);
+      res.heartRate = heartRate ?? res.heartRate;
+    } catch (e) {
+      console.warn('Heart rate fetch failed:', e);
+    }
 
-    const { strain, focusMinutes, longestBlock, totalSwitches } = res.today;
+    selectedDate = res.date || dateToLoad;
+
+    const { strain = 0, focusMinutes = 0, longestBlock = 0, totalSwitches = 0 } = res.today;
 
     // Attention span = inverse of strain (100 - strain). How much attention you have left.
     const attentionSpan = Math.round(100 - strain);
@@ -84,6 +127,13 @@ async function loadDashboard() {
     document.getElementById('strain').textContent = strain;
     document.getElementById('focus').textContent = attentionSpan;
     document.getElementById('block').textContent = longestBlock;
+
+    // Date nav
+    document.getElementById('dateLabel').textContent = formatDateLabel(res.date || selectedDate);
+    const datePrev = document.getElementById('datePrev');
+    const dateNext = document.getElementById('dateNext');
+    if (datePrev) datePrev.disabled = false;
+    if (dateNext) dateNext.disabled = res.isToday;
 
     setRingProgress(document.getElementById('strain-ring'), strain, 100);
     const focusRing = document.getElementById('focus-ring');
@@ -114,9 +164,9 @@ async function loadDashboard() {
         const iconSvg = ICONS[iconName] || '';
         const display = typeof value === 'number' && value % 1 !== 0
           ? value.toFixed(1) : value;
-        const unit = ['musicMinutes', 'youtubeWatchMinutes', 'feedMinutes'].includes(key)
+        const unit = ['musicMinutes', 'backgroundMusicMinutes', 'youtubeWatchMinutes', 'feedMinutes'].includes(key)
           ? 'm' : ['shortSessions', 'highSwitchMinutes', 'highScrollMinutes', 'lateNightMinutes'].includes(key)
-            ? ' min' : '';
+            ? ' min' : key === 'tabSwitches' ? ' switches' : '';
         li.innerHTML = `
           <span class="breakdown-item">
             <span class="culprit-icon">${iconSvg}</span>
@@ -132,13 +182,17 @@ async function loadDashboard() {
     // Session start hint
     const sessionHint = document.getElementById('sessionHint');
     if (sessionHint) {
+      const recoveryNote = ' Attention recovers when idle or during focused work (docs, long-form).';
       if (res.sessionStart) {
         const d = new Date(res.sessionStart);
-        sessionHint.textContent = `Chrome opened at ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}. ${res.visits?.length || 0} tab visits recorded.`;
+        sessionHint.textContent = `Chrome opened at ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}. ${res.visits?.length || 0} tab visits.${recoveryNote}`;
       } else if (!res.buckets?.length && !res.visits?.length) {
-        sessionHint.textContent = 'No activity recorded yet. Switch tabs or browse to start tracking.';
+        const hrNote = res.heartRate?.heartRateValues?.length
+          ? ` Heart rate: ${res.heartRate.heartRateValues.length} points loaded.`
+          : '';
+        sessionHint.textContent = 'No activity recorded yet. Switch tabs or browse to start tracking.' + hrNote;
       } else {
-        sessionHint.textContent = `${res.visits?.length || 0} tab visits recorded.`;
+        sessionHint.textContent = `${res.visits?.length || 0} tab visits.${recoveryNote}`;
       }
     }
 
@@ -152,9 +206,12 @@ async function loadDashboard() {
       return (isShortsCategory && isShortsUrl && activeSeconds >= 10) ? 1 : 0;
     };
 
-    // Timeline: Attention body-battery + stimulation swim lanes
+    // Timeline: Attention body-battery + stimulation swim lanes — all from res
+    const graphContainer = document.querySelector('.graph-container');
     const graphEl = document.getElementById('attentionGraph');
-    if (graphEl) {
+    if (graphContainer && graphEl) {
+      try {
+      graphEl.onclick = null;
       let data = res.hourlyTimeline || [];
 
       // Fallback: build hourly strain from buckets if timeline is empty
@@ -163,17 +220,27 @@ async function loadDashboard() {
         for (let h = 0; h < 24; h++) byHour[h] = { hour: h, strain: 0 };
         for (const b of buckets) {
           const h = b.hour ?? (parseInt(String(b.minute || '0').split(':')[0], 10) || 0);
-          const shorts = (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0);
-          const stimMins = ((b.stimulation_seconds || 0) + (b.youtube_watch_seconds || 0)) / 60;
+          const shortForm = (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0);
           const feedMins = ['X_HOME', 'REDDIT_FEED', 'YOUTUBE_HOME'].includes(b.category || '') ? (b.focused_seconds || 0) / 60 : 0;
-          byHour[h].strain += shorts * 3 + stimMins * 2 + feedMins * 1.5 + (b.switches || 0) * 0.8;
+          const cat = b.category || 'UNKNOWN';
+          const stimSec = b.stimulation_seconds || 0;
+          const ytSec = b.youtube_watch_seconds || 0;
+          let stimStrain = 0;
+          if (stimSec > 0) stimStrain += (['SPOTIFY', 'MUSIC'].includes(cat) ? 1.2 : ['DOCS_WORK', 'REDDIT_THREAD', 'X_THREAD', 'OTHER', 'UNKNOWN'].includes(cat) ? 0.4 : 1.0) * (stimSec / 60);
+          if (ytSec > 0) stimStrain += (cat === 'YOUTUBE_WATCH' ? 1.5 : 0.5) * (ytSec / 60);
+          byHour[h].strain += shortForm * 3 + stimStrain + feedMins * 1.5 + (b.switches || 0) * 1.8;
         }
         data = Object.values(byHour);
       }
+      // When no buckets and no timeline, use 24h placeholder so graph has structure
+      if (!data.length) {
+        data = Array.from({ length: 24 }, (_, h) => ({ hour: h, strain: 0 }));
+      }
 
-      // ── Time window: first activity → now ───────────────────────────────
+      // ── Time window: first activity → now (or full day for past dates) ────
       const nowDate   = new Date();
       const nowHourFrac = nowDate.getHours() + nowDate.getMinutes() / 60;
+      const isToday = res.isToday !== false;
       const sessionHour = res.sessionStart
         ? new Date(res.sessionStart).getHours() + new Date(res.sessionStart).getMinutes() / 60
         : null;
@@ -181,15 +248,21 @@ async function loadDashboard() {
         .filter(b => (b.focused_seconds || 0) > 10 || (b.switches || 0) > 0 || (b.shorts_count || 0) > 0)
         .sort((a, b2) => (a.hour ?? 0) - (b2.hour ?? 0))[0];
       const firstBucketHour = firstActiveBucket ? (firstActiveBucket.hour ?? null) : null;
-      // Use earlier of session or first activity — avoids steep drop when session starts
-      // after morning strain (e.g. Chrome opened 12:28 but user had 11am YT Shorts)
-      const startHour = Math.floor(
-        (sessionHour != null || firstBucketHour != null)
-          ? Math.min(sessionHour ?? 24, firstBucketHour ?? 24)
-          : Math.max(0, nowHourFrac - 1)
-      );
-      // End is current fractional hour (never draw the future)
-      const endHour = Math.max(startHour + 1, nowHourFrac);
+      let startHour, endHour;
+      if (isToday) {
+        startHour = Math.floor(
+          (sessionHour != null || firstBucketHour != null)
+            ? Math.min(sessionHour ?? 24, firstBucketHour ?? 24)
+            : Math.max(0, nowHourFrac - 1)
+        );
+        endHour = Math.max(startHour + 1, nowHourFrac);
+      } else {
+        startHour = 0;
+        endHour = 24;
+      }
+
+      const effectiveNowHourFrac = isToday ? nowHourFrac : 24;
+      const lastIntHour = Math.floor(effectiveNowHourFrac);
 
       // ── Layout ──────────────────────────────────────────────────────────
       const w = 640;
@@ -228,41 +301,67 @@ async function loadDashboard() {
       // Uses per-minute buckets for smooth up/down transitions.
       const dailyStrain   = res.today?.strain ?? 0;
       const attentionNow  = 100 - dailyStrain;
-      const lastIntHour   = Math.floor(nowHourFrac);
 
-      // Build per-minute raw strain from buckets (keyed by minute index for easy lookup)
+      // Build per-minute raw strain and recovery from buckets
       const FEED_SET = new Set(['X_HOME', 'X_SEARCH', 'X_OTHER', 'X_THREAD', 'REDDIT_FEED', 'YOUTUBE_HOME']);
+      const RECOVERY_CATEGORIES = new Set(['DOCS_WORK', 'REDDIT_THREAD', 'YOUTUBE_WATCH', 'X_THREAD']);
+      const WORK_OR_READ = new Set(['DOCS_WORK', 'REDDIT_THREAD', 'X_THREAD', 'OTHER', 'UNKNOWN']);
+      const MUSIC_CATEGORIES = new Set(['SPOTIFY', 'MUSIC']);
       const rawStrainByMinute = {};
+      const rawRecoveryByMinute = {};
       for (const b of buckets) {
         const minuteKey = b.minute || '00:00';
         const [hh, mm] = minuteKey.split(':').map(Number);
-        const minuteIdx = hh * 60 + mm;  // e.g. 9:30 -> 570
+        const minuteIdx = hh * 60 + mm;
         const hourFrac = hh + mm / 60;
         if (hourFrac < startHour || hourFrac > endHour) continue;
         const shortForm = (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0);
-        const stimMins = ((b.stimulation_seconds || 0) + (b.youtube_watch_seconds || 0)) / 60;
         const feedMins = FEED_SET.has(b.category || '') ? (b.focused_seconds || 0) / 60 : 0;
-        const strainRaw = shortForm * 3 + stimMins * 2 + feedMins * 1.5 + (b.switches || 0) * 0.8;
+        const cat = b.category || 'UNKNOWN';
+        const stimSec = b.stimulation_seconds || 0;
+        const ytSec = b.youtube_watch_seconds || 0;
+        let stimStrain = 0;
+        if (stimSec > 0) {
+          stimStrain += (MUSIC_CATEGORIES.has(cat) ? 1.2 : WORK_OR_READ.has(cat) ? 0.4 : 1.0) * (stimSec / 60);
+        }
+        if (ytSec > 0) {
+          stimStrain += (cat === 'YOUTUBE_WATCH' ? 1.5 : 0.5) * (ytSec / 60);
+        }
+        const strainRaw = shortForm * 3 + stimStrain + feedMins * 1.5 + (b.switches || 0) * 1.8;
         rawStrainByMinute[minuteIdx] = (rawStrainByMinute[minuteIdx] || 0) + strainRaw;
+
+        // Recovery: productive focus (docs, long-form reading) recharges attention
+        const isProductive = RECOVERY_CATEGORIES.has(b.category || '');
+        const noShortForm = shortForm === 0;
+        const lowSwitches = (b.switches || 0) <= 2;
+        const focusedMins = (b.focused_seconds || 0) / 60;
+        const ytMins = (b.youtube_watch_seconds || 0) / 60;
+        const ytLongForm = b.category === 'YOUTUBE_WATCH' && ytMins >= 2;
+        const qualifies = isProductive && noShortForm && lowSwitches && (focusedMins >= 1 || ytLongForm);
+        if (qualifies) {
+          const engagedMins = b.category === 'YOUTUBE_WATCH' ? Math.max(focusedMins, ytMins) : focusedMins;
+          const recoveryRaw = Math.min(0.5, engagedMins * 0.1 + (ytLongForm ? 0.15 : 0));
+          rawRecoveryByMinute[minuteIdx] = (rawRecoveryByMinute[minuteIdx] || 0) + recoveryRaw;
+        }
       }
 
       const totalRawStrain = Object.values(rawStrainByMinute).reduce((s, v) => s + v, 0);
-      // Weight by sqrt to dampen single-minute spikes from bursty event logging.
+      const totalRawRecovery = Object.values(rawRecoveryByMinute).reduce((s, v) => s + v, 0);
       const weightedStrainByMinute = {};
       for (const [minuteIdx, raw] of Object.entries(rawStrainByMinute)) {
         weightedStrainByMinute[minuteIdx] = Math.sqrt(Math.max(0, raw));
       }
       const totalWeightedStrain = Object.values(weightedStrainByMinute).reduce((s, v) => s + v, 0);
-      const RECOVERY_PER_IDLE_MINUTE = 0.05;
+      const RECOVERY_PER_IDLE_MINUTE = 0.15;
       const MAX_DROP_PER_MINUTE = 3.0;
-      const MAX_RISE_PER_MINUTE = 0.2;
+      const MAX_RISE_PER_MINUTE = 0.6;
 
       // Walk minute-by-minute from session start to now for granular curve
       const attPoints = [];
       const stepDetails = [];
       let att = 100;
       const startMinuteIdx = Math.floor(startHour * 60);
-      const endMinuteIdx = Math.floor(nowHourFrac * 60);
+      const endMinuteIdx = Math.floor(effectiveNowHourFrac * 60);
       const totalMinutes = Math.max(1, endMinuteIdx - startMinuteIdx);
       // Use 2-min steps for smooth curve (max ~240 points for 8h); 1-min for shorter sessions
       const step = totalMinutes <= 120 ? 1 : totalMinutes <= 360 ? 2 : 5;
@@ -275,32 +374,46 @@ async function loadDashboard() {
           const prevM = m - step;
           let stepRawStrain = 0;
           let stepWeightedStrain = 0;
+          let stepRecovery = 0;
           const minuteBreakdown = [];
           for (let i = prevM; i < m; i++) {
             const r = rawStrainByMinute[i] || 0;
             const w = weightedStrainByMinute[i] || 0;
+            const rec = rawRecoveryByMinute[i] || 0;
             stepRawStrain += r;
             stepWeightedStrain += w;
-            minuteBreakdown.push({ minuteIdx: i, hour: (i / 60).toFixed(2), rawStrain: r, weightedStrain: w });
+            stepRecovery += rec;
+            minuteBreakdown.push({ minuteIdx: i, hour: (i / 60).toFixed(2), rawStrain: r, weightedStrain: w, recovery: rec });
           }
+          const stepMinutes = m - prevM;
+          const idleRecovery = stepWeightedStrain === 0 ? RECOVERY_PER_IDLE_MINUTE * stepMinutes : 0;
+          const productiveRecovery = stepRecovery;
+          const totalRecovery = idleRecovery + productiveRecovery;
+          const maxRise = MAX_RISE_PER_MINUTE * stepMinutes;
+
           if (stepWeightedStrain > 0 && totalWeightedStrain > 0) {
             const depletion = (stepWeightedStrain / totalWeightedStrain) * dailyStrain;
-            const maxDrop = MAX_DROP_PER_MINUTE * (m - prevM);
-            const boundedDepletion = Math.min(depletion, maxDrop);
-            att = Math.max(0, att - boundedDepletion);
-            calc = {
-              formula: `depletion = (${stepWeightedStrain.toFixed(3)} / ${totalWeightedStrain.toFixed(3)}) * ${dailyStrain} = ${depletion.toFixed(4)}; bounded=${boundedDepletion.toFixed(4)}`,
-              prevM, m, stepRawStrain, stepWeightedStrain, totalRawStrain, totalWeightedStrain, dailyStrain, depletion, boundedDepletion, prevAtt, att, type: 'deplete',
-              minuteBreakdown
-            };
+            const netChange = productiveRecovery - depletion;
+            if (netChange > 0) {
+              const boundedRecovery = Math.min(netChange, maxRise);
+              att = Math.min(100, att + boundedRecovery);
+              calc = { prevM, m, stepRawStrain, stepWeightedStrain, stepRecovery, depletion, netChange, boundedRecovery, prevAtt, att, type: 'recover', minuteBreakdown };
+            } else {
+              const maxDrop = MAX_DROP_PER_MINUTE * stepMinutes;
+              const boundedDepletion = Math.min(-netChange, maxDrop);
+              att = Math.max(0, att - boundedDepletion);
+              calc = {
+                formula: `depletion = ${depletion.toFixed(4)} - recovery ${productiveRecovery.toFixed(4)} = ${(-netChange).toFixed(4)}`,
+                prevM, m, stepRawStrain, stepWeightedStrain, stepRecovery, totalRawStrain, totalWeightedStrain, dailyStrain, depletion, boundedDepletion, prevAtt, att, type: 'deplete',
+                minuteBreakdown
+              };
+            }
           } else {
-            const recovery = RECOVERY_PER_IDLE_MINUTE * (m - prevM);
-            const maxRise = MAX_RISE_PER_MINUTE * (m - prevM);
-            const boundedRecovery = Math.min(recovery, maxRise);
+            const boundedRecovery = Math.min(totalRecovery, maxRise);
             att = Math.min(100, att + boundedRecovery);
             calc = {
-              formula: `recovery = ${RECOVERY_PER_IDLE_MINUTE} * ${m - prevM} = ${recovery.toFixed(4)}; bounded=${boundedRecovery.toFixed(4)}`,
-              prevM, m, prevAtt, recovery, boundedRecovery, att, type: 'recover',
+              formula: `recovery = idle ${idleRecovery.toFixed(4)} + productive ${productiveRecovery.toFixed(4)} = ${totalRecovery.toFixed(4)}; bounded=${boundedRecovery.toFixed(4)}`,
+              prevM, m, prevAtt, idleRecovery, productiveRecovery, boundedRecovery, att, type: 'recover',
               minuteBreakdown
             };
           }
@@ -312,7 +425,7 @@ async function loadDashboard() {
         attPoints.push({ x: hourFrac, y: att, stepIndex: stepDetails.length - 1 });
       }
       const lastComputedAtt = attPoints.length > 0 ? attPoints[attPoints.length - 1].y : 100;
-      attPoints.push({ x: nowHourFrac, y: lastComputedAtt });
+      attPoints.push({ x: effectiveNowHourFrac, y: lastComputedAtt });
       // Smoothly align final point to the ring value so we avoid a terminal spike.
       const endpointDelta = attentionNow - lastComputedAtt;
       if (attPoints.length > 1 && Math.abs(endpointDelta) > 0.05) {
@@ -405,7 +518,7 @@ async function loadDashboard() {
       };
 
       // For strain bars (Strain view): scale bars against peak hourly raw strain
-      const activeData = data.filter(x => x.hour >= startHour && x.hour <= Math.floor(nowHourFrac));
+      const activeData = data.filter(x => x.hour >= startHour && x.hour <= lastIntHour);
       const maxStrain = Math.max(0, ...activeData.map(x => x.strain || 0));
       const effectiveMax = Math.max(maxStrain, 0.1);
 
@@ -414,7 +527,7 @@ async function loadDashboard() {
       for (let i = 1; i < attPoints.length; i++) {
         pathD += ` L ${xHour(attPoints[i].x)} ${y(attPoints[i].y)}`;
       }
-      const areaD = pathD + ` L ${xHour(nowHourFrac)} ${y(0)} L ${xHour(startHour)} ${y(0)} Z`;
+      const areaD = pathD + ` L ${xHour(effectiveNowHourFrac)} ${y(0)} L ${xHour(startHour)} ${y(0)} Z`;
 
       // ── Strain bars (Strain mode) ────────────────────────────────────────
       const barColW = plotW / hourRange;
@@ -538,7 +651,7 @@ async function loadDashboard() {
             const minuteStartHour = minuteIdx / 60;
             const minuteEndHour = (minuteIdx + 1) / 60;
             const segStart = Math.max(startHour, minuteStartHour);
-            const segEnd = Math.min(nowHourFrac, minuteEndHour);
+            const segEnd = Math.min(effectiveNowHourFrac, minuteEndHour);
             if (segEnd <= segStart) continue;
             const fraction = Math.min(1, mins);
             const bx = xHour(segStart) + 0.5;
@@ -553,7 +666,33 @@ async function loadDashboard() {
         }
       });
 
+      // ── Heart rate overlay (if available) ──────────────────────────────────
+      let heartRatePathD = '';
+      const heartRate = res.heartRate;
+      if (heartRate?.heartRateValues?.length) {
+        const dayStart = new Date((res.date || '') + 'T00:00:00').getTime();
+        const dayEnd = new Date((res.date || '') + 'T23:59:59.999').getTime();
+        const dayRange = dayEnd - dayStart || 1;
+        const hrValues = heartRate.heartRateValues.filter(([ts]) => ts >= dayStart && ts <= dayEnd);
+        const hrMin = Math.min(40, ...hrValues.map(([, hr]) => hr));
+        const hrMax = Math.max(120, ...hrValues.map(([, hr]) => hr));
+        const hrRange = hrMax - hrMin || 1;
+        const yHr = (hr) => pad.top + attnH - ((hr - hrMin) / hrRange) * attnH;
+        const points = hrValues
+          .map(([ts, hr]) => {
+            const frac = (ts - dayStart) / dayRange;
+            const hourFrac = startHour + frac * (endHour - startHour);
+            if (hourFrac < startHour || hourFrac > endHour) return null;
+            return { x: xHour(hourFrac), y: yHr(hr) };
+          })
+          .filter(Boolean);
+        if (points.length > 1) {
+          heartRatePathD = `M ${points[0].x} ${points[0].y}` + points.slice(1).map(p => ` L ${p.x} ${p.y}`).join('');
+        }
+      }
+
       // ── Assemble SVG ────────────────────────────────────────────────────
+      let svgContent = '';
       (() => {
           // Dynamic x-axis: ~4-6 labels spread across [startHour, nowHourFrac]
           function fmtHour(h) {
@@ -566,24 +705,26 @@ async function loadDashboard() {
           const span = endHour - startHour;
           const tickStep = span <= 4 ? 1 : span <= 10 ? 2 : 3;
           const firstTick = Math.ceil(startHour / tickStep) * tickStep;
-          const nowX = xHour(nowHourFrac);
+          const nowX = xHour(effectiveNowHourFrac);
           const MIN_LABEL_GAP = 28;
           let axisLabels = '';
           for (let h = firstTick; h <= Math.ceil(endHour); h += tickStep) {
             const tx = xHour(h);
             if (tx < pad.left - 4 || tx > pad.left + plotW + 4) continue;
-            const overlapsNow = h === Math.floor(nowHourFrac) && Math.abs(tx - nowX) < MIN_LABEL_GAP;
+            const overlapsNow = isToday && h === Math.floor(nowHourFrac) && Math.abs(tx - nowX) < MIN_LABEL_GAP;
             axisLabels += `<line x1="${tx}" y1="${xAxisY}" x2="${tx}" y2="${xAxisY + 4}" stroke="#2a2a2a" stroke-width="1"/>`;
             if (!overlapsNow) {
               axisLabels += `<text x="${tx}" y="${xLabelY}" fill="#a0a0a0" font-size="9" text-anchor="middle">${fmtHour(h)}</text>`;
             }
           }
-          // "NOW" tick — when hour label was skipped due to overlap, show "now" at normal position
-          axisLabels += `<line x1="${nowX}" y1="${pad.top}" x2="${nowX}" y2="${xAxisY}" stroke="#ffffff" stroke-width="0.5" stroke-dasharray="3,3" opacity="0.25"/>`;
-          axisLabels += `<text x="${nowX}" y="${xLabelY}" fill="#a0a0a0" font-size="8" font-weight="600" text-anchor="middle">now</text>`;
+          // "NOW" tick — only for today
+          if (isToday) {
+            axisLabels += `<line x1="${nowX}" y1="${pad.top}" x2="${nowX}" y2="${xAxisY}" stroke="#ffffff" stroke-width="0.5" stroke-dasharray="3,3" opacity="0.25"/>`;
+            axisLabels += `<text x="${nowX}" y="${xLabelY}" fill="#a0a0a0" font-size="8" font-weight="600" text-anchor="middle">now</text>`;
+          }
           const attentionColorTop = getAttentionColor(100);
           const attentionColorBottom = getAttentionColor(0);
-          graphEl.innerHTML = `
+          svgContent = `
             <defs>
               <linearGradient id="attentionGradient" x1="0" y1="1" x2="0" y2="0">
                 <stop offset="0%" stop-color="${attentionColorBottom}" stop-opacity="0.35"/>
@@ -608,13 +749,16 @@ async function loadDashboard() {
             <g class="attention-layer" data-metric-layer="attention">
               <path d="${areaD}" fill="url(#attentionGradient)"/>
               <path d="${pathD}" fill="none" stroke="url(#attentionLineGradient)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              ${heartRatePathD ? `<path d="${heartRatePathD}" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>` : ''}
             </g>
             <g class="stim-lanes" data-metric-layer="attention">${lanesSvg}</g>
           `;
         })();
+      graphContainer.innerHTML = `<svg class="attention-graph" id="attentionGraph" viewBox="0 0 ${w} ${chartH}" preserveAspectRatio="xMidYMid meet">${svgContent}</svg>`;
+      const updatedGraphEl = document.getElementById('attentionGraph');
 
       // Clickable lane dots/bars — show activity detail modal
-      graphEl.onclick = (e) => {
+      (updatedGraphEl || graphEl).onclick = (e) => {
         const g = e.target.closest('.lane-dot-hit, .lane-bar-hit');
         if (!g) return;
         const lane = g.dataset.lane;
@@ -685,8 +829,18 @@ async function loadDashboard() {
           <span class="legend-item">${bar('#1db954')} Music</span>
           <span class="legend-item">${bar('#FF4500')} Reddit</span>
           <span class="legend-item">${bar('#e7e9ea')} X</span>
+          ${heartRatePathD ? '<span class="legend-item"><span class="legend-line" style="background:#e74c3c"></span> Heart rate</span>' : ''}
         `;
       }
+    } catch (graphErr) {
+      console.error('Graph render failed for', res.date, graphErr);
+      const hrNote = res.heartRate?.heartRateValues?.length ? ` (${res.heartRate.heartRateValues.length} HR points)` : '';
+      graphContainer.innerHTML = `<svg class="attention-graph" id="attentionGraph" viewBox="0 0 640 400">
+        <text x="320" y="180" fill="#888" font-size="14" text-anchor="middle">${res.date || 'Unknown'}</text>
+        <text x="320" y="210" fill="#666" font-size="12" text-anchor="middle">Graph error — check console</text>
+        ${hrNote ? `<text x="320" y="240" fill="#34c759" font-size="11" text-anchor="middle">Heart rate data loaded${hrNote}</text>` : ''}
+      </svg>`;
+    }
     }
 
     // Activity log — collapsible per-minute breakdown
@@ -807,13 +961,26 @@ async function loadDashboard() {
   }
 }
 
+function changeDate(delta) {
+  const d = new Date(selectedDate + 'T12:00:00');
+  d.setDate(d.getDate() + delta);
+  const today = getLocalDateStr();
+  const newDate = getLocalDateStr(d);
+  if (newDate > today) return;
+  selectedDate = newDate;
+  loadDashboard(newDate);
+}
+
+document.getElementById('datePrev')?.addEventListener('click', () => changeDate(-1));
+document.getElementById('dateNext')?.addEventListener('click', () => changeDate(1));
+
 loadDashboard();
 window.addEventListener('focus', () => loadDashboard());
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) loadDashboard();
 });
 setInterval(() => {
-  if (!document.hidden) loadDashboard();
+  if (!document.hidden && selectedDate === getLocalDateStr()) loadDashboard();
 }, DASHBOARD_REFRESH_MS);
 
 // Debug export — always attached so it works even if graph block fails
@@ -845,4 +1012,154 @@ document.getElementById('activityModalBackdrop')?.addEventListener('click', () =
 });
 document.getElementById('activityModalClose')?.addEventListener('click', () => {
   document.getElementById('activityModal').style.display = 'none';
+});
+
+// Heart rate import
+document.getElementById('heartRateToggle')?.addEventListener('click', () => {
+  const body = document.getElementById('heartRateBody');
+  const toggle = document.getElementById('heartRateToggle');
+  const open = toggle?.getAttribute('aria-expanded') === 'true';
+  toggle?.setAttribute('aria-expanded', String(!open));
+  body.style.display = open ? 'none' : 'block';
+});
+
+// Heart rate import — process File objects (from drop or file picker)
+async function processHeartRateFiles(files) {
+  const statusEl = document.getElementById('heartRateStatus');
+  if (!files.length) return;
+  statusEl.textContent = `Processing ${files.length} file(s)...`;
+  statusEl.style.color = '';
+  try {
+    const storage = await getStorage();
+    const results = [];
+    for (const file of files) {
+      try {
+        const json = await file.text();
+        const parsed = storage.parseGarminHeartRate(json);
+        if (!parsed.date) {
+          results.push({ file: file.name, ok: false, error: 'Could not derive date' });
+          continue;
+        }
+        await storage.saveHeartRate(parsed.date, parsed);
+        results.push({ file: file.name, ok: true, date: parsed.date });
+      } catch (err) {
+        results.push({ file: file.name, ok: false, error: err?.message || String(err) });
+      }
+    }
+    const saved = results.filter(r => r.ok);
+    const failed = results.filter(r => !r.ok);
+    if (saved.length) {
+      const dates = [...new Set(saved.map(r => r.date))];
+      selectedDate = dates[0];
+      loadDashboard(dates[0]);
+    }
+    const msg = saved.length
+      ? `Saved ${saved.length}/${files.length}: ${saved.map(r => r.date).join(', ')}`
+      : '';
+    const errMsg = failed.length ? ` Failed: ${failed.map(r => `${r.file} (${r.error})`).join('; ')}` : '';
+    statusEl.textContent = msg + errMsg || 'No files saved.';
+    statusEl.style.color = failed.length ? (saved.length ? '' : '#e74c3c') : 'var(--focus)';
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + (e?.message || String(e));
+    statusEl.style.color = '#e74c3c';
+  }
+}
+
+// Heart rate drop zone + file picker
+function setupHeartRateDropZone(el) {
+  if (!el) return;
+  const handleFiles = (files) => {
+    const arr = Array.from(files || []);
+    if (arr.length) processHeartRateFiles(arr);
+  };
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove('drag-over');
+    document.getElementById('heartRateDropZone')?.classList.remove('drag-over');
+    const files = [];
+    if (e.dataTransfer.items) {
+      for (let i = 0; i < e.dataTransfer.items.length; i++) {
+        const item = e.dataTransfer.items[i];
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+    }
+    if (files.length === 0 && e.dataTransfer.files) {
+      files.push(...e.dataTransfer.files);
+    }
+    if (!files.length) {
+      document.getElementById('heartRateStatus').textContent = 'No files in drop. Use the browse button instead.';
+      document.getElementById('heartRateStatus').style.color = '#e74c3c';
+      return;
+    }
+    handleFiles(files);
+  };
+  const dropZone = document.getElementById('heartRateDropZone');
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    el.classList.add('drag-over');
+    dropZone?.classList.add('drag-over');
+  };
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!el.contains(e.relatedTarget)) {
+      el.classList.remove('drag-over');
+      dropZone?.classList.remove('drag-over');
+    }
+  };
+  el.addEventListener('dragover', handleDragOver);
+  el.addEventListener('dragenter', handleDragOver);
+  el.addEventListener('dragleave', handleDragLeave);
+  el.addEventListener('drop', handleDrop);
+}
+// Attach to body so the whole section accepts drops
+setupHeartRateDropZone(document.getElementById('heartRateBody'));
+
+// Browse button + click on drop zone — opens file picker (works when drag-drop doesn't)
+const openHeartRateFilePicker = () => document.getElementById('heartRateFileInput')?.click();
+document.getElementById('heartRateBrowseBtn')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  openHeartRateFilePicker();
+});
+document.getElementById('heartRateDropZone')?.addEventListener('click', () => openHeartRateFilePicker());
+document.getElementById('heartRateFileInput')?.addEventListener('change', (e) => {
+  const files = e.target.files;
+  if (files?.length) processHeartRateFiles(Array.from(files));
+  e.target.value = '';
+});
+
+document.getElementById('heartRateSaveBtn')?.addEventListener('click', async () => {
+  const jsonInput = document.getElementById('heartRateJson');
+  const statusEl = document.getElementById('heartRateStatus');
+  const json = jsonInput?.value?.trim();
+  if (!json) {
+    statusEl.textContent = 'Paste JSON first.';
+    return;
+  }
+  statusEl.textContent = 'Saving...';
+  statusEl.style.color = '';
+  try {
+    const storage = await getStorage();
+    const parsed = storage.parseGarminHeartRate(json);
+    if (!parsed.date) {
+      statusEl.textContent = 'Could not derive date from JSON (need calendarDate or heartRateValues timestamps).';
+      statusEl.style.color = '#e74c3c';
+      return;
+    }
+    await storage.saveHeartRate(parsed.date, parsed);
+    statusEl.textContent = `Saved for ${parsed.date}. Reloading...`;
+    statusEl.style.color = 'var(--focus)';
+    jsonInput.value = '';
+    selectedDate = parsed.date;
+    loadDashboard(parsed.date);
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + (e?.message || String(e));
+    statusEl.style.color = '#e74c3c';
+  }
 });

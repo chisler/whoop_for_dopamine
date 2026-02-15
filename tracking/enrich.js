@@ -1,4 +1,25 @@
-import { classifyUrl, isFeedCategory } from '../url-classifier.js';
+import { classifyUrl, isFeedCategory, isStimulationCategory } from '../url-classifier.js';
+
+const WORK_OR_READ = new Set(['DOCS_WORK', 'REDDIT_THREAD', 'X_THREAD', 'OTHER', 'UNKNOWN']);
+
+function strainPerBucket(b) {
+  const shortForm = (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0);
+  const feedMins = isFeedCategory(b.category || '') ? (b.focused_seconds || 0) / 60 : 0;
+  const switches = b.switches || 0;
+  const cat = b.category || 'UNKNOWN';
+  const stimSec = b.stimulation_seconds || 0;
+  const ytSec = b.youtube_watch_seconds || 0;
+
+  let stimStrain = 0;
+  if (stimSec > 0) {
+    stimStrain += (isStimulationCategory(cat) ? 1.2 : WORK_OR_READ.has(cat) ? 0.4 : 1.0) * (stimSec / 60);
+  }
+  if (ytSec > 0) {
+    stimStrain += (cat === 'YOUTUBE_WATCH' ? 1.5 : 0.5) * (ytSec / 60);
+  }
+
+  return shortForm * 3 + stimStrain + feedMins * 1.5 + switches * 1.8;
+}
 
 export function buildVisits(events) {
   return (events || [])
@@ -53,13 +74,9 @@ export function buildHourlyTimeline(buckets) {
     const tiktoks = b.tiktoks_count || 0;
     const stimSec = b.stimulation_seconds || 0;
     const ytSec = b.youtube_watch_seconds || 0;
-    const feedMins = isFeedCategory(b.category) ? b.focused_seconds / 60 : 0;
-    const switches = b.switches || 0;
-    const shortForm = shorts + reels + tiktoks;
-    const stimMins = (stimSec + ytSec) / 60;
-    const strainRaw = shortForm * 3 + stimMins * 2 + feedMins * 1.5 + switches * 0.8;
+    const feedMins = isFeedCategory(b.category || '') ? (b.focused_seconds || 0) / 60 : 0;
 
-    hourlyTimeline[h].strain += strainRaw;
+    hourlyTimeline[h].strain += strainPerBucket(b);
     if (stimSec > 5) hourlyTimeline[h].music = true;
     if (ytSec > 5) hourlyTimeline[h].youtube = true;
     if (shorts > 0) hourlyTimeline[h].shorts = true;
