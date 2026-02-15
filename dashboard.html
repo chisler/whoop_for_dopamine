@@ -112,6 +112,18 @@
       </div>
     </section>
 
+    <section class="correlation-metrics" id="correlationMetricsSection">
+      <button class="correlation-metrics-toggle" id="correlationMetricsToggle" aria-expanded="false">
+        <span>HR–STIMULATION CORRELATION METRICS</span>
+        <span class="toggle-arrow" id="correlationMetricsArrow">▸</span>
+      </button>
+      <div class="correlation-metrics-body" id="correlationMetricsBody" style="display:none">
+        <p class="correlation-hint">Tune these to experiment with how stimulation periods and HR elevation are detected. Changes apply on next reload.</p>
+        <div class="correlation-metrics-grid" id="correlationMetricsGrid"></div>
+        <button type="button" class="correlation-reset-btn" id="correlationResetBtn">Reset to defaults</button>
+      </div>
+    </section>
+
     <footer>
       <p class="privacy">Local-only · Nothing uploaded</p>
       <button type="button" class="debug-export-btn" id="debugExportBtn">Export debug JSON</button>

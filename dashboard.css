@@ -731,3 +731,98 @@ footer {
 .log-tag.yt      { background: #ff950022; color: #ff9500; }
 .log-tag.music   { background: #1db95422; color: #1db954; }
 .log-tag.focus   { background: #34c75922; color: #34c759; }
+
+/* HR–Stimulation correlation metrics */
+.correlation-metrics {
+  margin-bottom: 28px;
+}
+
+.correlation-metrics-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--card);
+  border: 1px solid var(--ring-bg);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  text-align: left;
+}
+
+.correlation-metrics-toggle:hover {
+  background: #2e2e2e;
+}
+
+.correlation-metrics-toggle .toggle-arrow {
+  transition: transform 0.2s;
+}
+
+.correlation-metrics-toggle[aria-expanded="true"] .toggle-arrow {
+  transform: rotate(90deg);
+}
+
+.correlation-metrics-body {
+  margin-top: 8px;
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--ring-bg);
+  border-radius: 8px;
+}
+
+.correlation-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 0 0 12px 0;
+}
+
+.correlation-metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 16px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.correlation-metric-row {
+  display: contents;
+}
+
+.correlation-metric-row .corr-label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.correlation-metric-row input[type="number"] {
+  width: 72px;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--ring-bg);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.correlation-reset-btn {
+  padding: 6px 14px;
+  background: transparent;
+  border: 1px solid var(--ring-bg);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.correlation-reset-btn:hover {
+  color: var(--text);
+  border-color: #444;
+}
+
+.legend-corr {
+  font-size: 10px;
+  color: var(--text-dim);
+}

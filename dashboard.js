@@ -8,6 +8,12 @@ async function getStorage() {
   return _storage;
 }
 
+let _hrCorrelation = null;
+async function getHrCorrelation() {
+  if (!_hrCorrelation) _hrCorrelation = await import('./hr-correlation.js');
+  return _hrCorrelation;
+}
+
 const RING_CIRCUMFERENCE = 2 * Math.PI * 44;
 const DASHBOARD_REFRESH_MS = 5000;
 let dashboardLoadInFlight = false;
@@ -450,8 +456,14 @@ async function loadDashboard(forceDate = null) {
       });
 
       // Store for export
+      let metricsConfig = {};
+      try {
+        const mod = await getHrCorrelation();
+        metricsConfig = mod.getMetricsConfig();
+      } catch (_) {}
       window.__attentionDebugExport = {
         exportedAt: new Date().toISOString(),
+        metricsConfig,
         spikeDetected: jump > 5,
         spikeInfo: jump > 5 ? { lastComputedAtt, attentionNow, jump } : null,
         params: {
@@ -666,13 +678,16 @@ async function loadDashboard(forceDate = null) {
         }
       });
 
-      // ── Heart rate overlay (if available) ──────────────────────────────────
+      // ── Heart rate overlay + HR–stimulation correlation ───────────────────────
       let heartRatePathD = '';
+      let heartRateElevatedPathD = '';
+      let stimulationBandsSvg = '';
+      let hrCorrelationSummary = null;
       const heartRate = res.heartRate;
       if (heartRate?.heartRateValues?.length) {
         const dayStart = new Date((res.date || '') + 'T00:00:00').getTime();
         const dayEnd = new Date((res.date || '') + 'T23:59:59.999').getTime();
-        const dayRange = dayEnd - dayStart || 1;
+        const MS_PER_HOUR = 3600 * 1000;
         const hrValues = heartRate.heartRateValues.filter(([ts]) => ts >= dayStart && ts <= dayEnd);
         const hrMin = Math.min(40, ...hrValues.map(([, hr]) => hr));
         const hrMax = Math.max(120, ...hrValues.map(([, hr]) => hr));
@@ -680,16 +695,55 @@ async function loadDashboard(forceDate = null) {
         const yHr = (hr) => pad.top + attnH - ((hr - hrMin) / hrRange) * attnH;
         const points = hrValues
           .map(([ts, hr]) => {
-            const frac = (ts - dayStart) / dayRange;
-            const hourFrac = startHour + frac * (endHour - startHour);
+            const hourFrac = (ts - dayStart) / MS_PER_HOUR;
             if (hourFrac < startHour || hourFrac > endHour) return null;
-            return { x: xHour(hourFrac), y: yHr(hr) };
+            return { hourFrac, x: xHour(hourFrac), y: yHr(hr), hr };
           })
           .filter(Boolean);
         if (points.length > 1) {
           heartRatePathD = `M ${points[0].x} ${points[0].y}` + points.slice(1).map(p => ` L ${p.x} ${p.y}`).join('');
         }
+
+        // Run HR–stimulation correlation
+        try {
+          const { runHrCorrelation } = await getHrCorrelation();
+          const corr = runHrCorrelation({
+            rawStrainByMinute,
+            buckets,
+            heartRateValues: heartRate.heartRateValues,
+            dateStr: res.date || selectedDate,
+            startHour,
+            endHour,
+          });
+          hrCorrelationSummary = corr;
+
+          // Stimulated period bands (vertical shaded regions)
+          for (const iv of corr.stimulatedIntervals || []) {
+            const x1 = xHour(iv.startHourFrac);
+            const x2 = xHour(iv.endHourFrac);
+            const w = Math.max(2, x2 - x1);
+            stimulationBandsSvg += `<rect x="${x1}" y="${pad.top}" width="${w}" height="${attnH}" fill="#f97316" opacity="0.12" rx="1"/>`;
+          }
+
+          // Elevated HR segments (HR rises during stimulation)
+          if (corr.hrElevatedSegments?.length && points.length > 1) {
+            const elevatedPaths = [];
+            for (const seg of corr.hrElevatedSegments) {
+              const segPoints = points.filter(p => p.hourFrac >= seg.startHourFrac && p.hourFrac <= seg.endHourFrac);
+              if (segPoints.length >= 2) {
+                const d = `M ${segPoints[0].x} ${segPoints[0].y}` + segPoints.slice(1).map(p => ` L ${p.x} ${p.y}`).join('');
+                elevatedPaths.push(d);
+              }
+            }
+            if (elevatedPaths.length) {
+              heartRateElevatedPathD = elevatedPaths.map(d => `<path d="${d}" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>`).join('');
+            }
+          }
+        } catch (e) {
+          console.warn('HR correlation failed:', e);
+        }
       }
+      if (window.__attentionDebugExport) window.__attentionDebugExport.hrCorrelationSummary = hrCorrelationSummary || null;
 
       // ── Assemble SVG ────────────────────────────────────────────────────
       let svgContent = '';
@@ -747,9 +801,11 @@ async function loadDashboard(forceDate = null) {
             <line x1="${pad.left}" y1="${lanesY - 4}" x2="${pad.left + plotW}" y2="${lanesY - 4}" stroke="#2a2a2a" stroke-width="0.5"/>
             <g class="strain-bars-full" data-metric-layer="strain" style="display:none">${strainBarsFull || `<text x="${pad.left + plotW / 2}" y="${pad.top + attnH / 2}" fill="#555" font-size="12" text-anchor="middle">No strain data yet</text>`}</g>
             <g class="attention-layer" data-metric-layer="attention">
+              ${stimulationBandsSvg ? `<g class="stimulation-bands">${stimulationBandsSvg}</g>` : ''}
               <path d="${areaD}" fill="url(#attentionGradient)"/>
               <path d="${pathD}" fill="none" stroke="url(#attentionLineGradient)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
               ${heartRatePathD ? `<path d="${heartRatePathD}" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>` : ''}
+              ${heartRateElevatedPathD || ''}
             </g>
             <g class="stim-lanes" data-metric-layer="attention">${lanesSvg}</g>
           `;
@@ -820,6 +876,23 @@ async function loadDashboard(forceDate = null) {
       if (legendEl) {
         const dot = (c) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};vertical-align:middle"></span>`;
         const bar = (c) => `<span style="display:inline-block;width:12px;height:5px;background:${c};vertical-align:middle;border-radius:1px;opacity:0.8"></span>`;
+        let corrNote = '';
+        if (hrCorrelationSummary && heartRatePathD) {
+          const { hrMeanStimulated, hrMeanBaseline, correlation, sampleCounts } = hrCorrelationSummary;
+          const delta = (hrMeanStimulated != null && hrMeanBaseline != null)
+            ? (hrMeanStimulated - hrMeanBaseline).toFixed(1)
+            : null;
+          const r = correlation != null ? correlation.toFixed(2) : null;
+          if (delta != null || r != null) {
+            const parts = [];
+            if (delta != null && Math.abs(parseFloat(delta)) >= 0.5) parts.push(`HR ${parseFloat(delta) > 0 ? '+' : ''}${delta} bpm during stim`);
+            if (r != null && sampleCounts?.stim + sampleCounts?.baseline >= 10) parts.push(`r=${r}`);
+            if (parts.length) corrNote = `<span class="legend-item legend-corr" title="Correlation: stimulation vs heart rate">${parts.join(' · ')}</span>`;
+          }
+          if (heartRateElevatedPathD) {
+            corrNote += '<span class="legend-item"><span class="legend-line" style="background:#ff6b6b;height:3px"></span> HR elevated</span>';
+          }
+        }
         legendEl.innerHTML = `
           <span class="legend-item"><span class="legend-line attention"></span> Attention</span>
           <span class="legend-item">${dot('#ff3b30')} = 1 Short</span>
@@ -830,6 +903,7 @@ async function loadDashboard(forceDate = null) {
           <span class="legend-item">${bar('#FF4500')} Reddit</span>
           <span class="legend-item">${bar('#e7e9ea')} X</span>
           ${heartRatePathD ? '<span class="legend-item"><span class="legend-line" style="background:#e74c3c"></span> Heart rate</span>' : ''}
+          ${corrNote}
         `;
       }
     } catch (graphErr) {
@@ -1163,3 +1237,53 @@ document.getElementById('heartRateSaveBtn')?.addEventListener('click', async () 
     statusEl.style.color = '#e74c3c';
   }
 });
+
+// Correlation metrics — collapsible + editable
+(async () => {
+  const toggle = document.getElementById('correlationMetricsToggle');
+  const body = document.getElementById('correlationMetricsBody');
+  const grid = document.getElementById('correlationMetricsGrid');
+  const resetBtn = document.getElementById('correlationResetBtn');
+  const arrow = document.getElementById('correlationMetricsArrow');
+  if (!toggle || !body || !grid) return;
+
+  const NUMERIC_KEYS = ['stimulationStrainThreshold', 'stimulationMinSeconds', 'hrLagMinutes', 'hrDecayMinutes', 'baselineMinMinutes', 'elevatedHrThresholdBpm', 'elevatedHrThresholdPct'];
+  const BOOL_KEYS = ['shortFormCountsAsStimulated', 'useAbsoluteElevation'];
+
+  async function renderGrid() {
+    const mod = await getHrCorrelation();
+    const cfg = mod.getMetricsConfig();
+    grid.innerHTML = Object.entries(cfg)
+      .map(([key, val]) => {
+        const label = mod.METRIC_LABELS[key] || key;
+        if (BOOL_KEYS.includes(key)) {
+          return `<label class="correlation-metric-row"><span class="corr-label">${label}</span><input type="checkbox" data-key="${key}" ${val ? 'checked' : ''}/></label>`;
+        }
+        return `<label class="correlation-metric-row"><span class="corr-label">${label}</span><input type="number" data-key="${key}" value="${val}" step="${key.includes('Pct') ? 0.01 : 1}" min="0"/></label>`;
+      })
+      .join('');
+    grid.querySelectorAll('input').forEach(inp => {
+      inp.addEventListener('change', () => {
+        const key = inp.dataset.key;
+        let val = inp.type === 'checkbox' ? inp.checked : (inp.type === 'number' ? parseFloat(inp.value) : inp.value);
+        if (key.includes('Seconds') || key.includes('Minutes') || key.includes('Bpm')) val = Math.max(0, val);
+        mod.saveMetricsOverrides({ [key]: val });
+        loadDashboard();
+      });
+    });
+  }
+
+  toggle.addEventListener('click', async () => {
+    const open = toggle.getAttribute('aria-expanded') === 'true';
+    toggle.setAttribute('aria-expanded', String(!open));
+    body.style.display = open ? 'none' : 'block';
+    if (!open && grid.innerHTML === '') await renderGrid();
+  });
+  resetBtn?.addEventListener('click', async () => {
+    const mod = await getHrCorrelation();
+    mod.resetMetricsToDefaults();
+    await renderGrid();
+    loadDashboard();
+  });
+  await renderGrid();
+})();
