@@ -9,9 +9,9 @@
 3. Click **Load unpacked**
 4. Select the `whoop_for_dopamine` folder
 
-## Garmin HR Export (Python)
+## Garmin Export (Python)
 
-Export daily heart rate data from Garmin Connect to JSON files.
+Export daily heart rate and activities from Garmin Connect to JSON files.
 
 ### Setup
 
@@ -34,6 +34,10 @@ Optional: specify date range with `--start` and `--end`:
 python garmin_hr_export.py --start 2026-01-01 --end 2026-02-15
 ```
 
-Output: `garmin_hr_json/YYYY-MM-DD.json` (contains `heartRateValues`: `[timestamp_ms, hr, ...]`)
+Flags: `--hr-only` (skip activities), `--activities-only` (skip heart rate)
+
+Output:
+- `garmin_hr_json/YYYY-MM-DD.json` — heart rate (`heartRateValues`: `[timestamp_ms, hr, ...]`)
+- `garmin_activities_json/YYYY-MM-DD.json` — activities (Strength, Running, etc.)
 
 Session is saved to `garmin_session/` so you typically only need to login once (MFA may be required on first run).

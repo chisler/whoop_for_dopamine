@@ -9,3 +9,4 @@ __pycache__/
 .env
 garmin_session/
 garmin_hr_json/
+garmin_activities_json/

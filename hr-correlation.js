@@ -15,6 +15,10 @@ const DEFAULTS = {
   elevatedHrThresholdBpm: 3,
   elevatedHrThresholdPct: 0.05,
   useAbsoluteElevation: true,
+  hrGrowthWindowMinutes: 2,
+  hrGrowthMinBpm: 3,
+  hrGrowthStartHour: 6,
+  hrGrowthEndHour: 23,
 };
 
 // ── Configurable metrics (tune for experimentation) ────────────────────────
@@ -57,9 +61,67 @@ export const METRIC_LABELS = {
   elevatedHrThresholdBpm: 'Elevated HR (+bpm)',
   elevatedHrThresholdPct: 'Elevated HR (+%)',
   useAbsoluteElevation: 'Use BPM (not %)',
+  hrGrowthWindowMinutes: 'HR growth window (min)',
+  hrGrowthMinBpm: 'HR growth min (+bpm)',
+  hrGrowthStartHour: 'HR growth from hour (0–23)',
+  hrGrowthEndHour: 'HR growth until hour (0–23)',
 };
 
 loadMetricsOverrides();
+
+/** Night hours (local) for resting baseline — typically asleep. */
+const NIGHT_START_HOUR = 1;
+const NIGHT_END_HOUR = 6;
+
+/**
+ * Compute resting HR baseline from night hours when Garmin restingHeartRate is unavailable.
+ * Uses 10th percentile of HR during night (1–6am) as proxy for true resting.
+ * @param {Array} heartRateValues - [[ts_ms, hr], ...]
+ * @param {string} dateStr - YYYY-MM-DD
+ * @returns {number|null} baseline bpm or null if insufficient data
+ */
+export function computeRestingBaselineFromNight(heartRateValues, dateStr) {
+  if (!heartRateValues?.length) return null;
+  const dayStart = new Date(dateStr + 'T00:00:00').getTime();
+  const MS_PER_HOUR = 3600 * 1000;
+  const nightStart = dayStart + NIGHT_START_HOUR * MS_PER_HOUR;
+  const nightEnd = dayStart + NIGHT_END_HOUR * MS_PER_HOUR;
+  const hrs = heartRateValues
+    .filter(([ts]) => ts >= nightStart && ts < nightEnd)
+    .map(([, hr]) => hr)
+    .filter(hr => hr > 0 && hr < 200);
+  if (hrs.length < 5) return null;
+  hrs.sort((a, b) => a - b);
+  const p10 = Math.floor(hrs.length * 0.1);
+  return hrs[p10] ?? hrs[0];
+}
+
+/**
+ * Build set of minute indices when user is in a Garmin activity (run, ride, etc.).
+ * Used to exclude exercise periods from "elevated HR" — we only want stationary browsing.
+ * @param {Array} activities - Garmin activities with startTimeLocal, duration
+ * @param {string} dateStr - YYYY-MM-DD
+ * @returns {Set<number>} minute indices (0–1439) in activity
+ */
+export function buildActivityMinuteSet(activities, dateStr) {
+  const set = new Set();
+  if (!activities?.length) return set;
+  const dayStart = new Date(dateStr + 'T00:00:00').getTime();
+  for (const a of activities) {
+    const startStr = a.startTimeLocal || a.startTimeGMT || '';
+    const m = startStr.match(/T(\d{2}):(\d{2})/);
+    const durSec = a.duration || a.elapsedDuration || 0;
+    if (!m || durSec <= 0) continue;
+    const startTs = new Date(startStr).getTime();
+    if (startStr.slice(0, 10) !== dateStr) continue;
+    const startMinuteIdx = Math.floor((startTs - dayStart) / 60000);
+    const endMinuteIdx = Math.floor((startTs - dayStart + durSec * 1000) / 60000);
+    for (let i = startMinuteIdx; i <= endMinuteIdx; i++) {
+      if (i >= 0 && i < 1440) set.add(i);
+    }
+  }
+  return set;
+}
 
 /**
  * Build stimulated intervals from raw strain and buckets.
@@ -149,11 +211,12 @@ export function buildStimulatedIntervals(rawStrainByMinute, buckets, startHour, 
  * @param {Array} stimulatedIntervals - from buildStimulatedIntervals
  * @param {number} startHour
  * @param {number} endHour
- * @returns {{ hrMeanStimulated, hrMeanBaseline, hrElevatedSegments, correlation, sampleCounts }}
+ * @param {{ restingBaseline?: number, activityMinutes?: Set<number> }} opts - restingBaseline from night/Garmin; activityMinutes to exclude (exercise)
+ * @returns {{ hrMeanStimulated, hrMeanBaseline, hrRestingBaseline, hrElevatedSegments, correlation, sampleCounts }}
  */
-export function computeHrCorrelation(heartRateValues, dateStr, stimulatedIntervals, startHour, endHour) {
+export function computeHrCorrelation(heartRateValues, dateStr, stimulatedIntervals, startHour, endHour, opts = {}) {
   if (!heartRateValues?.length) {
-    return { hrMeanStimulated: null, hrMeanBaseline: null, hrElevatedSegments: [], correlation: null, sampleCounts: { stim: 0, baseline: 0 } };
+    return { hrMeanStimulated: null, hrMeanBaseline: null, hrRestingBaseline: null, hrElevatedSegments: [], correlation: null, sampleCounts: { stim: 0, baseline: 0 } };
   }
 
   const dayStart = new Date(dateStr + 'T00:00:00').getTime();
@@ -188,6 +251,11 @@ export function computeHrCorrelation(heartRateValues, dateStr, stimulatedInterva
   const hrMeanStimulated = mean(hrStim);
   const hrMeanBaseline = mean(hrBaseline);
 
+  // Resting baseline: prefer provided value, else night HR, else non-stim mean
+  const { restingBaseline: providedResting, activityMinutes = new Set() } = opts;
+  const nightBaseline = computeRestingBaselineFromNight(heartRateValues, dateStr);
+  const hrRestingBaseline = providedResting ?? nightBaseline ?? hrMeanBaseline ?? 60;
+
   // Pearson correlation: (stimulation_level, hr) for each sample
   let correlation = null;
   if (hrWithTime.length >= 10) {
@@ -208,19 +276,33 @@ export function computeHrCorrelation(heartRateValues, dateStr, stimulatedInterva
     correlation = den > 1e-10 ? num / den : 0;
   }
 
-  // HR elevated segments: where HR exceeds baseline during stimulation
-  const baseline = hrMeanBaseline ?? 60;
-  const threshold = cfg.useAbsoluteElevation
-    ? baseline + cfg.elevatedHrThresholdBpm
-    : baseline * (1 + cfg.elevatedHrThresholdPct);
+  // HR growth segments: where HR is rising during device usage (browsing), NOT during exercise
+  // Only within configured time window (e.g. 6am–11pm to exclude night)
+  const growthWindow = Math.max(1, Math.ceil((cfg.hrGrowthWindowMinutes ?? 2) / 2));
+  const growthMinBpm = cfg.hrGrowthMinBpm ?? 3;
+  const growthStartHour = cfg.hrGrowthStartHour ?? 6;
+  const growthEndHour = cfg.hrGrowthEndHour ?? 23;
+
+  const inGrowthTimeWindow = (hourFrac) => {
+    const h = Math.floor(hourFrac);
+    return h >= growthStartHour && h <= growthEndHour;
+  };
 
   const hrElevatedSegments = [];
   let segStart = null;
   for (let i = 0; i < hrWithTime.length; i++) {
     const { hourFrac, hr, isStimulated } = hrWithTime[i];
-    const elevated = isStimulated && hr >= threshold;
-    if (elevated) {
-      if (segStart == null) segStart = hourFrac;
+    const minuteIdx = Math.floor(hourFrac * 60);
+    const inActivity = activityMinutes.has(minuteIdx);
+    const inTimeWindow = inGrowthTimeWindow(hourFrac);
+    let isGrowing = false;
+    if (isStimulated && !inActivity && inTimeWindow && i >= growthWindow) {
+      const prev = hrWithTime[i - growthWindow];
+      const delta = hr - prev.hr;
+      if (delta >= growthMinBpm) isGrowing = true;
+    }
+    if (isGrowing) {
+      if (segStart == null) segStart = hrWithTime[i - growthWindow]?.hourFrac ?? hourFrac;
     } else {
       if (segStart != null) {
         hrElevatedSegments.push({ startHourFrac: segStart, endHourFrac: hourFrac });
@@ -236,6 +318,7 @@ export function computeHrCorrelation(heartRateValues, dateStr, stimulatedInterva
   return {
     hrMeanStimulated,
     hrMeanBaseline,
+    hrRestingBaseline,
     hrElevatedSegments,
     correlation,
     sampleCounts: { stim: hrStim.length, baseline: hrBaseline.length },
@@ -244,10 +327,106 @@ export function computeHrCorrelation(heartRateValues, dateStr, stimulatedInterva
 }
 
 /**
- * Run full correlation pipeline.
+ * Build stimulated intervals by type: shortForm, music, ytWatch, feed.
  */
-export function runHrCorrelation({ rawStrainByMinute, buckets, heartRateValues, dateStr, startHour, endHour }) {
+function buildStimulatedIntervalsByType(buckets, startHour, endHour) {
+  const startMinuteIdx = Math.floor(startHour * 60);
+  const endMinuteIdx = Math.floor(endHour * 60);
+  const bucketsByMinute = {};
+  for (const b of buckets) {
+    const [hh, mm] = (b.minute || '00:00').split(':').map(Number);
+    const idx = hh * 60 + mm;
+    if (!bucketsByMinute[idx]) bucketsByMinute[idx] = [];
+    bucketsByMinute[idx].push(b);
+  }
+
+  const REDDIT_FEED = new Set(['REDDIT_FEED', 'REDDIT_THREAD']);
+  const X_FEED = new Set(['X_HOME', 'X_SEARCH', 'X_OTHER', 'X_THREAD']);
+  const FEED_SET = new Set([...REDDIT_FEED, ...X_FEED, 'YOUTUBE_HOME']);
+  const MUSIC_CAT = new Set(['SPOTIFY', 'MUSIC']);
+
+  const byType = { shortForm: new Set(), music: new Set(), ytWatch: new Set(), feed: new Set() };
+
+  for (let m = startMinuteIdx; m <= endMinuteIdx; m++) {
+    for (const b of bucketsByMinute[m] || []) {
+      const shortForm = (b.shorts_count || 0) + (b.reels_count || 0) + (b.tiktoks_count || 0);
+      const musicSec = MUSIC_CAT.has(b.category || '') ? (b.stimulation_seconds || 0) : 0;
+      const ytSec = b.youtube_watch_seconds || 0;
+      const feedMins = FEED_SET.has(b.category || '') ? (b.focused_seconds || 0) / 60 : 0;
+
+      if (shortForm > 0) byType.shortForm.add(m);
+      if (musicSec >= 15) byType.music.add(m);
+      if (ytSec >= 15) byType.ytWatch.add(m);
+      if (feedMins >= 0.25) byType.feed.add(m);
+    }
+  }
+
+  return byType;
+}
+
+/**
+ * Compute HR mean for a set of minute indices.
+ */
+function hrMeanForMinuteSet(heartRateValues, dateStr, minuteSet, startHour, endHour) {
+  if (!heartRateValues?.length || minuteSet.size === 0) return null;
+  const dayStart = new Date(dateStr + 'T00:00:00').getTime();
+  const MS_PER_HOUR = 3600 * 1000;
+  const hrs = [];
+  for (const [ts, hr] of heartRateValues) {
+    const hourFrac = (ts - dayStart) / MS_PER_HOUR;
+    if (hourFrac < startHour || hourFrac > endHour) continue;
+    const m = Math.floor(hourFrac * 60);
+    if (minuteSet.has(m)) hrs.push(hr);
+  }
+  return hrs.length ? hrs.reduce((s, v) => s + v, 0) / hrs.length : null;
+}
+
+/**
+ * Per-stimulation-type HR breakdown.
+ */
+export function computeHrCorrelationByType({ buckets, heartRateValues, dateStr, startHour, endHour }) {
+  const byType = buildStimulatedIntervalsByType(buckets, startHour, endHour);
+  const allStim = new Set([...byType.shortForm, ...byType.music, ...byType.ytWatch, ...byType.feed]);
+  const baselineSet = new Set();
+  const startMinuteIdx = Math.floor(startHour * 60);
+  const endMinuteIdx = Math.floor(endHour * 60);
+  for (let m = startMinuteIdx; m <= endMinuteIdx; m++) {
+    if (!allStim.has(m)) baselineSet.add(m);
+  }
+
+  const hrBaseline = hrMeanForMinuteSet(heartRateValues, dateStr, baselineSet, startHour, endHour);
+  const result = {};
+  for (const [key, minuteSet] of Object.entries(byType)) {
+    const hrMean = hrMeanForMinuteSet(heartRateValues, dateStr, minuteSet, startHour, endHour);
+    result[key] = {
+      hrMean,
+      hrBaseline,
+      delta: (hrMean != null && hrBaseline != null) ? hrMean - hrBaseline : null,
+      sampleCount: minuteSet.size,
+    };
+  }
+  return result;
+}
+
+/**
+ * Run full correlation pipeline.
+ * @param {Object} opts
+ * @param {Object} opts.heartRate - full heart rate object (heartRateValues, restingHeartRate, minHeartRate)
+ * @param {Array} opts.activities - Garmin activities for the day (to exclude exercise periods)
+ */
+export function runHrCorrelation({ rawStrainByMinute, buckets, heartRateValues, heartRate, activities, dateStr, startHour, endHour }) {
+  const hrValues = heartRateValues ?? heartRate?.heartRateValues ?? [];
   const stimulatedIntervals = buildStimulatedIntervals(rawStrainByMinute, buckets, startHour, endHour);
-  const result = computeHrCorrelation(heartRateValues, dateStr, stimulatedIntervals, startHour, endHour);
+  const restingBaseline = heartRate?.restingHeartRate ?? heartRate?.minHeartRate ?? null;
+  const activityMinutes = buildActivityMinuteSet(activities ?? [], dateStr);
+  const result = computeHrCorrelation(hrValues, dateStr, stimulatedIntervals, startHour, endHour, {
+    restingBaseline: restingBaseline ?? undefined,
+    activityMinutes,
+  });
+  if (hrValues?.length && buckets?.length) {
+    try {
+      result.byType = computeHrCorrelationByType({ buckets, heartRateValues: hrValues, dateStr, startHour, endHour });
+    } catch (_) {}
+  }
   return result;
 }

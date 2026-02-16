@@ -3,7 +3,7 @@
  */
 
 import { classifyUrl } from './url-classifier.js';
-import { addEvent, getBucketsForDate, getBucketsInRange, getEventsForDate, getHeartRateForDate } from './storage.js';
+import { addEvent, getBucketsForDate, getBucketsInRange, getEventsForDate, getHeartRateForDate, getActivitiesForDate } from './storage.js';
 import { getDomainFromUrl, getLocalDateStr } from './tracking/time.js';
 import { createTrackerRuntime } from './tracking/runtime.js';
 import { computeDopamineStrain, computeFocusMinutes, computeStrainBreakdown } from './tracking/scoring.js';
@@ -134,6 +134,7 @@ async function buildDashboardPayload(requestDate = null) {
   const { [sessionKey]: sessionStart } = await chrome.storage.local.get(sessionKey);
 
   const heartRate = await getHeartRateForDate(targetDate);
+  const activities = await getActivitiesForDate(targetDate);
 
   let visits = getVisitsWithFallback(events);
   if (visits.length === 0) {
@@ -177,6 +178,7 @@ async function buildDashboardPayload(requestDate = null) {
     date: targetDate,
     isToday: targetDate === today,
     heartRate,
+    activities,
     today: {
       strain,
       focusMinutes: totalFocus,

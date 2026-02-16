@@ -59,13 +59,16 @@
 
     <section class="stimulation-timeline">
       <h2>TIMELINE</h2>
-      <p class="timeline-hint" id="sessionHint">Attention depletes with feeds & short-form; recovers when idle or during focused work (docs, long-form reading).</p>
+      <p class="timeline-hint" id="sessionHint">Attention depletes with feeds & short-form; recovers when idle.</p>
       <div class="graph-filters">
         <button class="filter-btn active" data-metric="attention">Attention</button>
-        <button class="filter-btn" data-metric="strain">Strain</button>
+        <button class="filter-btn" data-metric="hr">Heart rate</button>
+        <button class="filter-btn" data-metric="switching">Switching</button>
+        <button class="filter-btn" data-metric="activity">Activity</button>
       </div>
-      <div class="graph-container">
+      <div class="graph-container" id="graphContainer">
         <svg class="attention-graph" id="attentionGraph" viewBox="0 0 640 320" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="graph-tooltip" id="graphTooltip" role="tooltip" aria-hidden="true"></div>
       </div>
       <div class="graph-legend">
         <span class="legend-item"><span class="legend-line attention"></span> Attention</span>
@@ -109,6 +112,23 @@
         <textarea id="heartRateJson" placeholder='{"calendarDate":"2026-02-14","heartRateValues":[[ts,hr],...],...}' rows="6"></textarea>
         <button type="button" class="heart-rate-save-btn" id="heartRateSaveBtn">Save</button>
         <p class="heart-rate-status" id="heartRateStatus"></p>
+      </div>
+    </section>
+
+    <section class="activities-import">
+      <button class="activities-toggle" id="activitiesToggle" aria-expanded="false">
+        <span>IMPORT ACTIVITIES (Garmin JSON)</span>
+        <span class="toggle-arrow" id="activitiesToggleArrow">▸</span>
+      </button>
+      <div class="activities-body" id="activitiesBody" style="display:none">
+        <p class="activities-hint">Paste Garmin activities JSON or drop files here. From <code>python garmin_hr_export.py</code> or <code>garmin_activities_json/YYYY-MM-DD.json</code>.</p>
+        <div class="activities-drop-zone" id="activitiesDropZone">
+          <input type="file" id="activitiesFileInput" accept=".json,application/json" multiple hidden>
+          <span class="activities-drop-text">Drop files or <button type="button" class="activities-browse-btn" id="activitiesBrowseBtn">browse</button></span>
+        </div>
+        <textarea id="activitiesJson" placeholder='{"calendarDate":"2026-02-14","activities":[{...}]}' rows="4"></textarea>
+        <button type="button" class="activities-save-btn" id="activitiesSaveBtn">Save</button>
+        <p class="activities-status" id="activitiesStatus"></p>
       </div>
     </section>
 

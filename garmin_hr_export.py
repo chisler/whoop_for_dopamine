@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Download daily heart rate data from Garmin Connect and save as JSON files.
+Download daily heart rate and activities from Garmin Connect, save as JSON.
 Uses garth for authentication and API access.
 """
 import argparse
@@ -18,6 +18,7 @@ from garth.exc import GarthException
 
 # ---------- config ----------
 OUT_DIR = "garmin_hr_json"
+ACTIVITIES_DIR = "garmin_activities_json"
 SESSION_DIR = "garmin_session"  # directory with oauth1/oauth2 tokens
 # --------------------------
 
@@ -29,8 +30,17 @@ def daterange(d0: date, d1: date):
         d += timedelta(days=1)
 
 
+def fetch_activities(iso: str) -> list[str]:
+    """Fetch activities for a date. Returns list of activity dicts."""
+    display_key = garth.client.user_profile["displayName"]
+    path = f"/activitylist-service/activities/fordailysummary/{display_key}?calendarDate={iso}"
+    data = garth.connectapi(path)
+    return data if isinstance(data, list) else []
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(ACTIVITIES_DIR, exist_ok=True)
 
     # Try to resume existing session first
     if os.path.exists(os.path.join(SESSION_DIR, "oauth1_token.json")):
@@ -53,7 +63,7 @@ def main():
         print("Logged in and saved session")
 
     # Date range: CLI args or defaults
-    parser = argparse.ArgumentParser(description="Export Garmin HR data to JSON")
+    parser = argparse.ArgumentParser(description="Export Garmin HR and activities to JSON")
     parser.add_argument(
         "--start",
         type=str,
@@ -66,29 +76,55 @@ def main():
         default="2026-02-15",
         help="End date (YYYY-MM-DD)",
     )
+    parser.add_argument(
+        "--hr-only",
+        action="store_true",
+        help="Only fetch heart rate (skip activities)",
+    )
+    parser.add_argument(
+        "--activities-only",
+        action="store_true",
+        help="Only fetch activities (skip heart rate)",
+    )
     args = parser.parse_args()
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
 
+    today = date.today()
     for d in daterange(start, end):
         iso = d.isoformat()
-        out_path = os.path.join(OUT_DIR, f"{iso}.json")
-        if os.path.exists(out_path):
-            print("skip (exists)", out_path)
-            continue
+        is_today = d == today
 
-        try:
-            data = garth.connectapi(
-                f"/wellness-service/wellness/dailyHeartRate?date={iso}"
-            )
-        except GarthException as e:
-            print("error", iso, e)
-            continue
+        # Heart rate
+        if not args.activities_only:
+            hr_path = os.path.join(OUT_DIR, f"{iso}.json")
+            if os.path.exists(hr_path) and not is_today:
+                print("skip hr (exists)", hr_path)
+            else:
+                try:
+                    hr_data = garth.connectapi(
+                        f"/wellness-service/wellness/dailyHeartRate?date={iso}"
+                    )
+                    with open(hr_path, "w", encoding="utf-8") as f:
+                        json.dump(hr_data, f, ensure_ascii=False, indent=2)
+                    print("saved hr", hr_path)
+                except GarthException as e:
+                    print("hr error", iso, e)
 
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        print("saved", out_path)
+        # Activities
+        if not args.hr_only:
+            act_path = os.path.join(ACTIVITIES_DIR, f"{iso}.json")
+            if not os.path.exists(act_path) or is_today:
+                try:
+                    activities = fetch_activities(iso)
+                    out = {"calendarDate": iso, "activities": activities}
+                    with open(act_path, "w", encoding="utf-8") as f:
+                        json.dump(out, f, ensure_ascii=False, indent=2)
+                    print("saved activities", act_path, f"({len(activities)} activities)")
+                except GarthException as e:
+                    print("activities error", iso, e)
+            elif not is_today:
+                print("skip activities (exists)", act_path)
 
 
 if __name__ == "__main__":

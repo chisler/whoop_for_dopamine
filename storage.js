@@ -4,8 +4,8 @@
  */
 
 const DB_NAME = 'whoop-dopamine';
-const DB_VERSION = 2;
-const STORES = { events: 'events', buckets: 'buckets', heartRate: 'heartRate' };
+const DB_VERSION = 3;
+const STORES = { events: 'events', buckets: 'buckets', heartRate: 'heartRate', activities: 'activities' };
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -24,6 +24,9 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains('heartRate')) {
         db.createObjectStore('heartRate', { keyPath: 'date' });
+      }
+      if (!db.objectStoreNames.contains('activities')) {
+        db.createObjectStore('activities', { keyPath: 'date' });
       }
     };
   });
@@ -176,6 +179,41 @@ export async function getHeartRateForDate(dateStr) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction('heartRate', 'readonly');
     const req = tx.objectStore('heartRate').get(dateStr);
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export function parseGarminActivities(json) {
+  let data;
+  try {
+    const str = typeof json === 'string' ? json.replace(/^\uFEFF/, '').trim() : json;
+    data = typeof str === 'string' ? JSON.parse(str) : str;
+  } catch (e) {
+    throw new Error('Invalid JSON: ' + (e?.message || 'parse error'));
+  }
+  const activities = data.activities || (Array.isArray(data) ? data : []);
+  const dateStr = data.calendarDate || (activities[0]?.startTimeLocal?.slice(0, 10) || null);
+  if (!dateStr) throw new Error('Could not derive date from activities JSON');
+  return { date: dateStr, calendarDate: dateStr, activities };
+}
+
+export async function saveActivities(dateStr, data) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const record = { date: dateStr, ...data };
+    const tx = db.transaction('activities', 'readwrite');
+    tx.objectStore('activities').put(record);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getActivitiesForDate(dateStr) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('activities', 'readonly');
+    const req = tx.objectStore('activities').get(dateStr);
     req.onsuccess = () => { db.close(); resolve(req.result || null); };
     req.onerror = () => reject(req.error);
   });

@@ -95,8 +95,8 @@ function formatDateLabel(dateStr) {
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
-async function loadDashboard(forceDate = null) {
-  if (dashboardLoadInFlight) return;
+async function loadDashboard(forceDate = null, forceReload = false) {
+  if (dashboardLoadInFlight && !forceReload) return;
   dashboardLoadInFlight = true;
   const dateToLoad = forceDate ?? selectedDate;
   try {
@@ -114,13 +114,15 @@ async function loadDashboard(forceDate = null) {
     if (!res.today) {
       res.today = { strain: 0, focusMinutes: 0, longestBlock: 0, totalSwitches: 0 };
     }
-    // Fetch heart rate directly from IndexedDB (avoids service worker context issues)
+    // Fetch heart rate and activities directly from IndexedDB (avoids service worker context issues)
     try {
       const storage = await getStorage();
       const heartRate = await storage.getHeartRateForDate(res.date || dateToLoad);
       res.heartRate = heartRate ?? res.heartRate;
+      const activities = await storage.getActivitiesForDate(res.date || dateToLoad);
+      res.activities = activities ?? res.activities;
     } catch (e) {
-      console.warn('Heart rate fetch failed:', e);
+      console.warn('Storage fetch failed:', e);
     }
 
     selectedDate = res.date || dateToLoad;
@@ -295,7 +297,10 @@ async function loadDashboard(forceDate = null) {
       const LANE_H = 28;
       const LANE_GAP = 3;
       const ICON_W = 16;
-      const lanesY = xLabelY + 22;             // 182 — top of first lane
+      const ACTIVITIES_LANE_H = 24;
+      const activities = res.activities?.activities || [];
+      const hasActivities = activities.length > 0;
+      const lanesY = xLabelY + 22 + (hasActivities ? ACTIVITIES_LANE_H + 8 : 0);
       const chartH = lanesY + LANES.length * (LANE_H + LANE_GAP) + 8;
 
       graphEl.setAttribute('viewBox', `0 0 ${w} ${chartH}`);
@@ -529,11 +534,6 @@ async function loadDashboard(forceDate = null) {
         }))
       };
 
-      // For strain bars (Strain view): scale bars against peak hourly raw strain
-      const activeData = data.filter(x => x.hour >= startHour && x.hour <= lastIntHour);
-      const maxStrain = Math.max(0, ...activeData.map(x => x.strain || 0));
-      const effectiveMax = Math.max(maxStrain, 0.1);
-
       // Draw path through granular attention points
       let pathD = `M ${xHour(attPoints[0].x)} ${y(attPoints[0].y)}`;
       for (let i = 1; i < attPoints.length; i++) {
@@ -541,23 +541,36 @@ async function loadDashboard(forceDate = null) {
       }
       const areaD = pathD + ` L ${xHour(effectiveNowHourFrac)} ${y(0)} L ${xHour(startHour)} ${y(0)} Z`;
 
-      // ── Strain bars (Strain mode) ────────────────────────────────────────
       const barColW = plotW / hourRange;
-      let strainBarsFull = '';
-      for (let h = startHour; h <= lastIntHour; h++) {
-        const d = data.find(x => x.hour === h) || { strain: 0 };
-        const val = Number(d.strain) || 0;
-        if (val > 0) {
-          const bh = Math.max(4, (val / effectiveMax) * attnH);
-          const bx = xHour(h) + barColW * 0.08;
-          const bw = barColW * 0.84;
-          strainBarsFull += `<rect x="${bx}" y="${xAxisY - bh}" width="${bw}" height="${bh}" fill="#f97316" opacity="0.85"/>`;
-        }
+
+      // ── Switching speed: switches per minute at each moment (rolling window) ─
+      const switchesByMinute = {};
+      for (const b of buckets) {
+        const [hh, mm] = String(b.minute || '00:00').split(':').map(v => parseInt(v, 10) || 0);
+        const minuteIdx = hh * 60 + mm;
+        const hourFrac = hh + mm / 60;
+        if (hourFrac < startHour || hourFrac > endHour) continue;
+        switchesByMinute[minuteIdx] = (switchesByMinute[minuteIdx] || 0) + (b.switches || 0);
       }
+      const SWITCH_WINDOW_MIN = 5;
+      const switchingPoints = [];
+      for (let m = startMinuteIdx; m <= endMinuteIdx; m += step) {
+        const windowStart = Math.max(startMinuteIdx, m - SWITCH_WINDOW_MIN + 1);
+        let windowSwitches = 0;
+        for (let i = windowStart; i <= m; i++) windowSwitches += switchesByMinute[i] || 0;
+        const windowMins = Math.max(1, m - windowStart + 1);
+        const rate = windowSwitches / windowMins;
+        switchingPoints.push({ x: m / 60, rate });
+      }
+      const maxSwitchRate = Math.max(1, ...switchingPoints.map(p => p.rate));
+      const switchingPathD = switchingPoints.length >= 2
+        ? `M ${xHour(switchingPoints[0].x)} ${y((switchingPoints[0].rate / maxSwitchRate) * 100)}` +
+          switchingPoints.slice(1).map(p => ` L ${xHour(p.x)} ${y((p.rate / maxSwitchRate) * 100)}`).join('')
+        : '';
 
       // ── Per-hour stimulation aggregation ────────────────────────────────
       const hourAgg = {};
-      for (let h = 0; h < 24; h++) {
+      for (let h = 0; h <= 24; h++) {
         hourAgg[h] = { shorts: 0, reels: 0, tiktoks: 0, musicMins: 0, ytMins: 0, redditMins: 0, xMins: 0 };
       }
       const minuteAgg = {};
@@ -683,6 +696,7 @@ async function loadDashboard(forceDate = null) {
       let heartRateElevatedPathD = '';
       let stimulationBandsSvg = '';
       let hrCorrelationSummary = null;
+      let hrPoints = [];
       const heartRate = res.heartRate;
       if (heartRate?.heartRateValues?.length) {
         const dayStart = new Date((res.date || '') + 'T00:00:00').getTime();
@@ -703,14 +717,18 @@ async function loadDashboard(forceDate = null) {
         if (points.length > 1) {
           heartRatePathD = `M ${points[0].x} ${points[0].y}` + points.slice(1).map(p => ` L ${p.x} ${p.y}`).join('');
         }
+        hrPoints = points;
 
-        // Run HR–stimulation correlation
+        // Run HR–stimulation correlation (resting baseline from Garmin or night HR; exclude Garmin activities)
         try {
           const { runHrCorrelation } = await getHrCorrelation();
+          const activities = res.activities?.activities || [];
           const corr = runHrCorrelation({
             rawStrainByMinute,
             buckets,
+            heartRate: heartRate,
             heartRateValues: heartRate.heartRateValues,
+            activities,
             dateStr: res.date || selectedDate,
             startHour,
             endHour,
@@ -725,7 +743,7 @@ async function loadDashboard(forceDate = null) {
             stimulationBandsSvg += `<rect x="${x1}" y="${pad.top}" width="${w}" height="${attnH}" fill="#f97316" opacity="0.12" rx="1"/>`;
           }
 
-          // Elevated HR segments (HR rises during stimulation)
+          // HR growth segments (HR rising during browsing, correlated with device usage)
           if (corr.hrElevatedSegments?.length && points.length > 1) {
             const elevatedPaths = [];
             for (const seg of corr.hrElevatedSegments) {
@@ -736,7 +754,7 @@ async function loadDashboard(forceDate = null) {
               }
             }
             if (elevatedPaths.length) {
-              heartRateElevatedPathD = elevatedPaths.map(d => `<path d="${d}" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>`).join('');
+              heartRateElevatedPathD = elevatedPaths.map(d => `<path class="hr-elevated-path" d="${d}" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>`).join('');
             }
           }
         } catch (e) {
@@ -799,19 +817,137 @@ async function loadDashboard(forceDate = null) {
               <text x="${pad.left}" y="${xLabelY + 14}" fill="#555" font-size="8" font-weight="600" letter-spacing="0.1em">STIMULATION</text>
             </g>
             <line x1="${pad.left}" y1="${lanesY - 4}" x2="${pad.left + plotW}" y2="${lanesY - 4}" stroke="#2a2a2a" stroke-width="0.5"/>
-            <g class="strain-bars-full" data-metric-layer="strain" style="display:none">${strainBarsFull || `<text x="${pad.left + plotW / 2}" y="${pad.top + attnH / 2}" fill="#555" font-size="12" text-anchor="middle">No strain data yet</text>`}</g>
-            <g class="attention-layer" data-metric-layer="attention">
+            ${hasActivities ? (() => {
+              const actY = xLabelY + 18;
+              let actSvg = `<text x="${pad.left}" y="${actY - 2}" fill="#555" font-size="8" font-weight="600" letter-spacing="0.05em">GARMIN</text>`;
+              for (const a of activities) {
+                const startStr = a.startTimeLocal || a.startTimeGMT || '';
+                const m = startStr.match(/T(\d{2}):(\d{2})/);
+                const durSec = a.duration || a.elapsedDuration || 0;
+                if (!m || durSec <= 0) continue;
+                const startHourFrac = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+                const endHourFrac = startHourFrac + durSec / 3600;
+                if (endHourFrac < startHour || startHourFrac > endHour) continue;
+                const x1 = Math.max(pad.left, xHour(startHourFrac));
+                const x2 = Math.min(pad.left + plotW, xHour(endHourFrac));
+                const bw = Math.max(4, x2 - x1);
+                const name = (a.activityName || a.activityType?.typeKey || 'Activity').replace(/_/g, ' ');
+                actSvg += `<g title="${name} ${Math.round(durSec/60)}m"><rect x="${x1}" y="${actY - 10}" width="${bw}" height="14" fill="#5856d6" opacity="0.7" rx="2"/><text x="${x1 + 4}" y="${actY - 1}" fill="white" font-size="9" font-weight="600">${name.slice(0, 12)}</text></g>`;
+              }
+              return actSvg;
+            })() : ''}
+            <g class="attention-curve" data-metric-layer="attention">
               ${stimulationBandsSvg ? `<g class="stimulation-bands">${stimulationBandsSvg}</g>` : ''}
               <path d="${areaD}" fill="url(#attentionGradient)"/>
               <path d="${pathD}" fill="none" stroke="url(#attentionLineGradient)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              ${heartRatePathD ? `<path d="${heartRatePathD}" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>` : ''}
+            </g>
+            <g class="hr-layer" data-metric-layer="hr">
+              ${heartRatePathD ? `<path class="hr-full-path" d="${heartRatePathD}" fill="none" stroke="#e74c3c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>` : ''}
               ${heartRateElevatedPathD || ''}
             </g>
-            <g class="stim-lanes" data-metric-layer="attention">${lanesSvg}</g>
+            <g class="switching-layer" data-metric-layer="switching">
+              ${switchingPathD ? `<path class="switching-path" d="${switchingPathD}" fill="none" stroke="#af52de" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>` : ''}
+            </g>
+            <g class="stim-lanes" data-metric-layer="activity">${lanesSvg}</g>
           `;
         })();
-      graphContainer.innerHTML = `<svg class="attention-graph" id="attentionGraph" viewBox="0 0 ${w} ${chartH}" preserveAspectRatio="xMidYMid meet">${svgContent}</svg>`;
+      graphContainer.innerHTML = `<svg class="attention-graph" id="attentionGraph" viewBox="0 0 ${w} ${chartH}" preserveAspectRatio="xMidYMid meet" data-chart-h-full="${chartH}">${svgContent}</svg>`;
+      let tooltipEl = document.getElementById('graphTooltip');
+      if (!tooltipEl) {
+        tooltipEl = document.createElement('div');
+        tooltipEl.className = 'graph-tooltip';
+        tooltipEl.id = 'graphTooltip';
+        tooltipEl.setAttribute('role', 'tooltip');
+        tooltipEl.setAttribute('aria-hidden', 'true');
+        graphContainer.appendChild(tooltipEl);
+      }
       const updatedGraphEl = document.getElementById('attentionGraph');
+
+      // Hover tooltip: show metric value at cursor position
+      const fmtTime = (hf) => {
+        const h = Math.floor(hf); const m = Math.round((hf - h) * 60);
+        const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+        return `${h12}:${String(m).padStart(2, '0')}${h < 12 ? 'a' : 'p'}`;
+      };
+      const getPointAt = (hourFrac, metric) => {
+        const lerp = (arr, key, valKey) => {
+          if (!arr?.length) return null;
+          let i = 0;
+          while (i < arr.length - 1 && arr[i + 1][key] < hourFrac) i++;
+          if (arr[i][key] > hourFrac) return arr[0][valKey];
+          if (i >= arr.length - 1) return arr[arr.length - 1][valKey];
+          const a = arr[i], b = arr[i + 1];
+          const t = (hourFrac - a[key]) / (b[key] - a[key] || 1);
+          return a[valKey] + t * (b[valKey] - a[valKey]);
+        };
+        const svgX = xHour(hourFrac);
+        if (metric === 'attention') {
+          const v = lerp(attPoints, 'x', 'y');
+          if (v == null) return null;
+          return { x: svgX, y: y(v), info: { value: Math.round(v), unit: '%', label: 'Attention' } };
+        }
+        if (metric === 'hr') {
+          const px = lerp(hrPoints, 'hourFrac', 'x');
+          const py = lerp(hrPoints, 'hourFrac', 'y');
+          const v = lerp(hrPoints, 'hourFrac', 'hr');
+          if (v == null || px == null || py == null) return null;
+          return { x: svgX, y: py, info: { value: Math.round(v), unit: 'bpm', label: 'Heart rate' } };
+        }
+        if (metric === 'switching') {
+          const v = lerp(switchingPoints, 'x', 'rate');
+          if (v == null) return null;
+          const scaled = (v / maxSwitchRate) * 100;
+          return { x: svgX, y: y(scaled), info: { value: v.toFixed(1), unit: 'switches/min', label: 'Switch speed' } };
+        }
+        return null;
+      };
+      const hoverDot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      hoverDot.setAttribute('r', '5');
+      hoverDot.setAttribute('fill', '#fff');
+      hoverDot.setAttribute('stroke', '#333');
+      hoverDot.setAttribute('stroke-width', '2');
+      hoverDot.setAttribute('class', 'graph-hover-dot');
+      hoverDot.style.display = 'none';
+      hoverDot.style.pointerEvents = 'none';
+      updatedGraphEl.appendChild(hoverDot);
+      const setupHover = () => {
+        const svg = updatedGraphEl;
+        if (!svg) return;
+        const onMove = (e) => {
+          const rect = svg.getBoundingClientRect();
+          const x = (e.clientX - rect.left) / rect.width * 640;
+          if (x < pad.left || x > pad.left + plotW) {
+            tooltipEl.classList.remove('visible');
+            hoverDot.style.display = 'none';
+            return;
+          }
+          const hourFrac = startHour + (x - pad.left) / plotW * hourRange;
+          const metric = document.querySelector('.filter-btn.active')?.dataset?.metric || 'attention';
+          const pt = getPointAt(hourFrac, metric);
+          if (!pt) {
+            tooltipEl.classList.remove('visible');
+            hoverDot.style.display = 'none';
+            return;
+          }
+          tooltipEl.textContent = `${fmtTime(hourFrac)} · ${pt.info.label}: ${pt.info.value} ${pt.info.unit}`;
+          tooltipEl.classList.add('visible');
+          hoverDot.setAttribute('cx', pt.x);
+          hoverDot.setAttribute('cy', pt.y);
+          hoverDot.style.display = '';
+          const containerRect = graphContainer.getBoundingClientRect();
+          const left = e.clientX - containerRect.left + 12;
+          const top = e.clientY - containerRect.top + 8;
+          tooltipEl.style.left = `${Math.min(left, containerRect.width - 140)}px`;
+          tooltipEl.style.top = `${top}px`;
+        };
+        const onLeave = () => {
+          tooltipEl.classList.remove('visible');
+          hoverDot.style.display = 'none';
+        };
+        svg.addEventListener('mousemove', onMove);
+        svg.addEventListener('mouseleave', onLeave);
+      };
+      setupHover();
 
       // Clickable lane dots/bars — show activity detail modal
       (updatedGraphEl || graphEl).onclick = (e) => {
@@ -878,7 +1014,7 @@ async function loadDashboard(forceDate = null) {
         const bar = (c) => `<span style="display:inline-block;width:12px;height:5px;background:${c};vertical-align:middle;border-radius:1px;opacity:0.8"></span>`;
         let corrNote = '';
         if (hrCorrelationSummary && heartRatePathD) {
-          const { hrMeanStimulated, hrMeanBaseline, correlation, sampleCounts } = hrCorrelationSummary;
+          const { hrMeanStimulated, hrMeanBaseline, correlation, sampleCounts, byType } = hrCorrelationSummary;
           const delta = (hrMeanStimulated != null && hrMeanBaseline != null)
             ? (hrMeanStimulated - hrMeanBaseline).toFixed(1)
             : null;
@@ -888,6 +1024,17 @@ async function loadDashboard(forceDate = null) {
             if (delta != null && Math.abs(parseFloat(delta)) >= 0.5) parts.push(`HR ${parseFloat(delta) > 0 ? '+' : ''}${delta} bpm during stim`);
             if (r != null && sampleCounts?.stim + sampleCounts?.baseline >= 10) parts.push(`r=${r}`);
             if (parts.length) corrNote = `<span class="legend-item legend-corr" title="Correlation: stimulation vs heart rate">${parts.join(' · ')}</span>`;
+          }
+          if (byType && Object.keys(byType).length > 0) {
+            const typeLabels = { shortForm: 'Shorts', music: 'Music', ytWatch: 'YT', feed: 'Feed' };
+            const typeParts = [];
+            for (const [k, v] of Object.entries(byType)) {
+              if (v?.delta != null && v.sampleCount > 0) {
+                const d = v.delta.toFixed(1);
+                typeParts.push(`${typeLabels[k] || k}: ${parseFloat(d) > 0 ? '+' : ''}${d}`);
+              }
+            }
+            if (typeParts.length) corrNote += `<span class="legend-item legend-corr" title="HR delta by stimulation type">${typeParts.join(' · ')}</span>`;
           }
           if (heartRateElevatedPathD) {
             corrNote += '<span class="legend-item"><span class="legend-line" style="background:#ff6b6b;height:3px"></span> HR elevated</span>';
@@ -1005,33 +1152,87 @@ async function loadDashboard(forceDate = null) {
       };
     })();
 
-    // Filter toggles: Attention vs Strain
+    // Filter toggles: Attention | HR | Activity
     document.querySelectorAll('.filter-btn').forEach(btn => {
       if (btn.dataset.bound === '1') return;
       btn.dataset.bound = '1';
       btn.addEventListener('click', () => {
         document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        const metric = btn.dataset.metric;
-        const graph = document.getElementById('attentionGraph');
-        if (graph) {
-          const attentionLayers = graph.querySelectorAll('[data-metric-layer="attention"]');
-          const strainLayer = graph.querySelector('[data-metric-layer="strain"]');
-          if (metric === 'attention') {
-            attentionLayers.forEach(el => { if (el) el.style.display = ''; });
-            if (strainLayer) strainLayer.style.display = 'none';
-          } else {
-            attentionLayers.forEach(el => { if (el) el.style.display = 'none'; });
-            if (strainLayer) strainLayer.style.display = '';
-          }
-        }
+        applyViewMode(btn.dataset.metric);
       });
     });
+    const activeMetric = document.querySelector('.filter-btn.active')?.dataset?.metric || 'attention';
+    applyViewMode(activeMetric);
 
   } catch (e) {
     console.error('Dashboard load failed:', e);
   } finally {
     dashboardLoadInFlight = false;
+  }
+}
+
+function applyViewMode(metric) {
+  const graph = document.getElementById('attentionGraph');
+  const timeline = document.querySelector('.stimulation-timeline');
+  const legendEl = document.querySelector('.graph-legend');
+  if (!graph) return;
+  const attentionLayer = graph.querySelector('[data-metric-layer="attention"]');
+  const hrLayer = graph.querySelector('[data-metric-layer="hr"]');
+  const switchingLayer = graph.querySelector('[data-metric-layer="switching"]');
+  const activityLayer = graph.querySelector('[data-metric-layer="activity"]');
+  const hrFullPath = graph.querySelector('.hr-full-path');
+  const switchingPath = graph.querySelector('.switching-path');
+  const full = graph.dataset.chartHFull;
+  timeline?.classList.remove('timeline-view-attention', 'timeline-view-hr', 'timeline-view-switching', 'timeline-view-activity');
+  timeline?.classList.add(`timeline-view-${metric}`);
+  if (activityLayer) activityLayer.style.display = '';
+  if (full) graph.setAttribute('viewBox', `0 0 640 ${full}`);
+  if (metric === 'attention') {
+    if (attentionLayer) { attentionLayer.style.display = ''; attentionLayer.style.opacity = '1'; }
+    if (hrLayer) { hrLayer.style.display = ''; if (hrFullPath) hrFullPath.style.opacity = '0.4'; }
+    if (switchingLayer) { switchingLayer.style.display = ''; if (switchingPath) switchingPath.style.opacity = '0.4'; }
+  } else if (metric === 'hr') {
+    if (attentionLayer) { attentionLayer.style.display = ''; attentionLayer.style.opacity = '0.35'; }
+    if (hrLayer) { hrLayer.style.display = ''; if (hrFullPath) hrFullPath.style.opacity = '1'; }
+    if (switchingLayer) { switchingLayer.style.display = ''; if (switchingPath) switchingPath.style.opacity = '0.4'; }
+  } else if (metric === 'switching') {
+    if (attentionLayer) { attentionLayer.style.display = ''; attentionLayer.style.opacity = '0.3'; }
+    if (hrLayer) { hrLayer.style.display = ''; if (hrFullPath) hrFullPath.style.opacity = '0.4'; }
+    if (switchingLayer) { switchingLayer.style.display = ''; if (switchingPath) switchingPath.style.opacity = '1'; }
+  } else {
+    if (attentionLayer) { attentionLayer.style.display = ''; attentionLayer.style.opacity = '0.3'; }
+    if (hrLayer) { hrLayer.style.display = ''; if (hrFullPath) hrFullPath.style.opacity = '0.4'; }
+    if (switchingLayer) { switchingLayer.style.display = ''; if (switchingPath) switchingPath.style.opacity = '0.4'; }
+  }
+  if (legendEl) {
+    const dot = (c) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};vertical-align:middle"></span>`;
+    const bar = (c) => `<span style="display:inline-block;width:12px;height:5px;background:${c};vertical-align:middle;border-radius:1px;opacity:0.8"></span>`;
+    const activityLegend = `${dot('#ff3b30')} Shorts · ${dot('#e1306c')} Reels · ${dot('#69c9d0')} TikTok · ${bar('#ff9500')} YT · ${bar('#1db954')} Music · ${bar('#FF4500')} Reddit · ${bar('#e7e9ea')} X`;
+    if (metric === 'attention') {
+      legendEl.innerHTML = `<span class="legend-item"><span class="legend-line attention"></span> Attention</span>`;
+      if (hrLayer?.querySelector('path')) legendEl.innerHTML += '<span class="legend-item"><span class="legend-line" style="background:#e74c3c;opacity:0.6"></span> Heart rate</span>';
+      if (graph.querySelector('.hr-elevated-path')) legendEl.innerHTML += '<span class="legend-item"><span class="legend-line" style="background:#ff6b6b;height:3px"></span> HR rising during browsing</span>';
+      if (graph.querySelector('.switching-path')) legendEl.innerHTML += '<span class="legend-item"><span class="legend-line" style="background:#af52de;opacity:0.6"></span> Context switches</span>';
+      legendEl.innerHTML += `<span class="legend-item">${activityLegend}</span>`;
+    } else if (metric === 'hr') {
+      legendEl.innerHTML = '';
+      if (hrLayer?.querySelector('path')) {
+        legendEl.innerHTML += '<span class="legend-item"><span class="legend-line" style="background:#e74c3c"></span> Heart rate</span>';
+        if (graph.querySelector('.hr-elevated-path')) legendEl.innerHTML += '<span class="legend-item"><span class="legend-line" style="background:#ff6b6b;height:3px"></span> HR rising during browsing</span>';
+        const corr = window.__attentionDebugExport?.hrCorrelationSummary;
+        if (corr?.correlation != null) legendEl.innerHTML += `<span class="legend-item legend-corr">r=${corr.correlation.toFixed(2)}</span>`;
+      } else {
+        legendEl.innerHTML = '<span class="legend-item" style="color:var(--text-dim)">Import Garmin HR to see heart rate</span>';
+      }
+      if (graph.querySelector('.switching-path')) legendEl.innerHTML += '<span class="legend-item"><span class="legend-line" style="background:#af52de;opacity:0.6"></span> Context switches</span>';
+      legendEl.innerHTML += `<span class="legend-item">${activityLegend}</span>`;
+    } else if (metric === 'switching') {
+      legendEl.innerHTML = '<span class="legend-item"><span class="legend-line" style="background:#af52de;height:3px"></span> Switch speed (switches/min, 5‑min window)</span>';
+      legendEl.innerHTML += `<span class="legend-item">${activityLegend}</span>`;
+    } else {
+      legendEl.innerHTML = `<span class="legend-item">${activityLegend}</span>`;
+    }
   }
 }
 
@@ -1125,7 +1326,7 @@ async function processHeartRateFiles(files) {
     if (saved.length) {
       const dates = [...new Set(saved.map(r => r.date))];
       selectedDate = dates[0];
-      loadDashboard(dates[0]);
+      loadDashboard(dates[0], true);
     }
     const msg = saved.length
       ? `Saved ${saved.length}/${files.length}: ${saved.map(r => r.date).join(', ')}`
@@ -1231,7 +1432,136 @@ document.getElementById('heartRateSaveBtn')?.addEventListener('click', async () 
     statusEl.style.color = 'var(--focus)';
     jsonInput.value = '';
     selectedDate = parsed.date;
-    loadDashboard(parsed.date);
+    loadDashboard(parsed.date, true);
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + (e?.message || String(e));
+    statusEl.style.color = '#e74c3c';
+  }
+});
+
+// Activities import
+document.getElementById('activitiesToggle')?.addEventListener('click', () => {
+  const body = document.getElementById('activitiesBody');
+  const toggle = document.getElementById('activitiesToggle');
+  const open = toggle?.getAttribute('aria-expanded') === 'true';
+  toggle?.setAttribute('aria-expanded', String(!open));
+  body.style.display = open ? 'none' : 'block';
+});
+
+async function processActivitiesFiles(files) {
+  const statusEl = document.getElementById('activitiesStatus');
+  if (!files?.length) return;
+  statusEl.textContent = `Processing ${files.length} file(s)...`;
+  statusEl.style.color = '';
+  try {
+    const storage = await getStorage();
+    const results = [];
+    for (const file of files) {
+      try {
+        const json = await file.text();
+        const parsed = storage.parseGarminActivities(json);
+        if (!parsed.date) {
+          results.push({ file: file.name, ok: false, error: 'Could not derive date' });
+          continue;
+        }
+        await storage.saveActivities(parsed.date, parsed);
+        results.push({ file: file.name, ok: true, date: parsed.date });
+      } catch (err) {
+        results.push({ file: file.name, ok: false, error: err?.message || String(err) });
+      }
+    }
+    const saved = results.filter(r => r.ok);
+    const failed = results.filter(r => !r.ok);
+    if (saved.length) {
+      selectedDate = saved[0].date;
+      loadDashboard(saved[0].date, true);
+    }
+    statusEl.textContent = saved.length
+      ? `Saved ${saved.length}/${files.length}: ${saved.map(r => r.date).join(', ')}`
+      : '';
+    statusEl.textContent += failed.length ? ` Failed: ${failed.map(r => `${r.file} (${r.error})`).join('; ')}` : '';
+    statusEl.style.color = failed.length ? (saved.length ? '' : '#e74c3c') : 'var(--focus)';
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + (e?.message || String(e));
+    statusEl.style.color = '#e74c3c';
+  }
+}
+
+function setupActivitiesDropZone(el) {
+  if (!el) return;
+  const dropZone = document.getElementById('activitiesDropZone');
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove('drag-over');
+    dropZone?.classList.remove('drag-over');
+    const files = [];
+    if (e.dataTransfer?.items) {
+      for (let i = 0; i < e.dataTransfer.items.length; i++) {
+        const item = e.dataTransfer.items[i];
+        if (item.kind === 'file') {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    if (!files.length && e.dataTransfer?.files) files.push(...e.dataTransfer.files);
+    if (files.length) processActivitiesFiles(files);
+    else document.getElementById('activitiesStatus').textContent = 'No files in drop.';
+  };
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    el.classList.add('drag-over');
+    dropZone?.classList.add('drag-over');
+  };
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    if (!el.contains(e.relatedTarget)) {
+      el.classList.remove('drag-over');
+      dropZone?.classList.remove('drag-over');
+    }
+  };
+  el.addEventListener('dragover', handleDragOver);
+  el.addEventListener('drop', handleDrop);
+  el.addEventListener('dragleave', handleDragLeave);
+}
+setupActivitiesDropZone(document.getElementById('activitiesBody'));
+document.getElementById('activitiesBrowseBtn')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('activitiesFileInput')?.click();
+});
+document.getElementById('activitiesDropZone')?.addEventListener('click', () => document.getElementById('activitiesFileInput')?.click());
+document.getElementById('activitiesFileInput')?.addEventListener('change', (e) => {
+  const files = e.target.files;
+  if (files?.length) processActivitiesFiles(Array.from(files));
+  e.target.value = '';
+});
+document.getElementById('activitiesSaveBtn')?.addEventListener('click', async () => {
+  const jsonInput = document.getElementById('activitiesJson');
+  const statusEl = document.getElementById('activitiesStatus');
+  const json = jsonInput?.value?.trim();
+  if (!json) {
+    statusEl.textContent = 'Paste JSON first.';
+    return;
+  }
+  statusEl.textContent = 'Saving...';
+  statusEl.style.color = '';
+  try {
+    const storage = await getStorage();
+    const parsed = storage.parseGarminActivities(json);
+    if (!parsed.date) {
+      statusEl.textContent = 'Could not derive date from JSON.';
+      statusEl.style.color = '#e74c3c';
+      return;
+    }
+    await storage.saveActivities(parsed.date, parsed);
+    statusEl.textContent = `Saved for ${parsed.date}. Reloading...`;
+    statusEl.style.color = 'var(--focus)';
+    jsonInput.value = '';
+    selectedDate = parsed.date;
+    loadDashboard(parsed.date, true);
   } catch (e) {
     statusEl.textContent = 'Error: ' + (e?.message || String(e));
     statusEl.style.color = '#e74c3c';
@@ -1247,7 +1577,7 @@ document.getElementById('heartRateSaveBtn')?.addEventListener('click', async () 
   const arrow = document.getElementById('correlationMetricsArrow');
   if (!toggle || !body || !grid) return;
 
-  const NUMERIC_KEYS = ['stimulationStrainThreshold', 'stimulationMinSeconds', 'hrLagMinutes', 'hrDecayMinutes', 'baselineMinMinutes', 'elevatedHrThresholdBpm', 'elevatedHrThresholdPct'];
+  const NUMERIC_KEYS = ['stimulationStrainThreshold', 'stimulationMinSeconds', 'hrLagMinutes', 'hrDecayMinutes', 'baselineMinMinutes', 'elevatedHrThresholdBpm', 'elevatedHrThresholdPct', 'hrGrowthWindowMinutes', 'hrGrowthMinBpm', 'hrGrowthStartHour', 'hrGrowthEndHour'];
   const BOOL_KEYS = ['shortFormCountsAsStimulated', 'useAbsoluteElevation'];
 
   async function renderGrid() {

@@ -91,12 +91,12 @@ h1 {
   margin: 6px 0 0 0;
 }
 
-/* Circular rings — Whoop style, prominent */
+/* Circular rings — compact, single row */
 .rings {
   display: flex;
   justify-content: center;
-  gap: 40px;
-  margin-bottom: 40px;
+  gap: 24px;
+  margin-bottom: 28px;
   flex-wrap: wrap;
 }
 
@@ -108,8 +108,8 @@ h1 {
 
 .ring-wrap {
   position: relative;
-  width: 160px;
-  height: 160px;
+  width: 100px;
+  height: 100px;
 }
 
 .ring {
@@ -145,8 +145,8 @@ h1 {
   justify-content: center;
   background: var(--text);
   border-radius: 50%;
-  margin: 16px;
-  font-size: 28px;
+  margin: 10px;
+  font-size: 18px;
   font-weight: 700;
   color: var(--bg);
 }
@@ -158,11 +158,11 @@ h1 {
 }
 
 .ring-label {
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 600;
-  letter-spacing: 0.1em;
-  color: var(--text);
-  margin-top: 16px;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-top: 8px;
   text-align: center;
   line-height: 1.2;
 }
@@ -324,10 +324,38 @@ h1 {
 }
 
 .graph-container {
+  position: relative;
   background: var(--card);
   border-radius: 10px;
   padding: 16px;
   overflow: hidden;
+}
+
+.graph-tooltip {
+  position: absolute;
+  pointer-events: none;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.1s;
+  z-index: 10;
+}
+
+.graph-tooltip.visible {
+  opacity: 1;
+}
+
+.graph-hover-dot {
+  filter: drop-shadow(0 0 2px rgba(0,0,0,0.5));
+}
+
+.stimulation-timeline .graph-container {
+  max-height: 520px;
 }
 
 .attention-graph {
@@ -720,6 +748,98 @@ footer {
 }
 
 .heart-rate-status {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 8px 0 0 0;
+}
+
+/* Activities import */
+.activities-import {
+  margin-bottom: 28px;
+}
+
+.activities-toggle {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--card);
+  border: none;
+  border-radius: 10px;
+  padding: 12px 16px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+}
+
+.activities-toggle:hover {
+  background: #2e2e2e;
+}
+
+.activities-toggle .toggle-arrow {
+  transition: transform 0.2s;
+}
+
+.activities-toggle[aria-expanded="true"] .toggle-arrow {
+  transform: rotate(90deg);
+}
+
+.activities-body {
+  margin-top: 8px;
+  padding: 16px;
+  background: var(--card);
+  border-radius: 10px;
+}
+
+.activities-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 0 0 12px 0;
+}
+
+.activities-hint code {
+  font-size: 10px;
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.activities-drop-zone {
+  border: 2px dashed var(--ring-bg);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+  margin-bottom: 12px;
+}
+
+.activities-drop-zone.drag-over,
+.activities-body.drag-over .activities-drop-zone {
+  border-color: #5856d6;
+  background: rgba(88, 86, 214, 0.08);
+}
+
+.activities-browse-btn {
+  background: none;
+  border: none;
+  color: #5856d6;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.activities-save-btn {
+  padding: 8px 20px;
+  background: #5856d6;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.activities-status {
   font-size: 11px;
   color: var(--text-dim);
   margin: 8px 0 0 0;
